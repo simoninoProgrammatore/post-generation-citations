@@ -1,0 +1,46 @@
+# Post-Generation Citation System - Configuration
+
+# Dataset settings
+dataset:
+  name: "asqa"                    # Options: asqa, qampari, eli5
+  data_dir: "data/alce"
+  num_passages: 100               # Number of pre-retrieved passages per query (5 or 100)
+
+# Generation settings
+generation:
+  model: "gpt-4"                  # LLM for response generation
+  max_tokens: 300
+  temperature: 0.7
+
+# Decomposition settings
+decomposition:
+  method: "llm"                   # Options: llm, spacy, heuristic
+  model: "gpt-4"                  # LLM for claim decomposition (if method=llm)
+
+# Retrieval / Evidence matching settings
+retrieval:
+  method: "nli"                   # Options: nli, embedding_similarity, bm25
+  nli_model: "cross-encoder/nli-deberta-v3-large"
+  top_k: 3                        # Max citations per claim
+  threshold: 0.5                  # NLI entailment threshold
+
+# Citation settings
+citation:
+  style: "inline"                 # Options: inline, report, narrative
+  max_citations_per_claim: 3
+  remove_unsupported: false       # Whether to remove claims with no evidence
+
+# Evaluation settings
+evaluation:
+  metrics:
+    - citation_precision_nli
+    - citation_recall_nli
+    - citation_f1_nli
+    - correctness
+    - fluency
+  nli_model: "cross-encoder/nli-deberta-v3-large"
+
+# Output settings
+output:
+  dir: "results"
+  save_intermediate: true         # Save intermediate outputs (claims, matches, etc.)
