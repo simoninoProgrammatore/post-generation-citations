@@ -5,6 +5,7 @@ Given a list of claims and a pool of candidate passages (provided
 by ALCE), this module determines which passages support each claim.
 """
 
+import re
 import json
 import argparse
 from pathlib import Path
@@ -15,57 +16,82 @@ from functools import lru_cache
 # Evidence extraction
 # ──────────────────────────────────────────────
 
-def extract_evidence(claim: str, passage_text: str, model: str = "claude-haiku-4-5-20251001") -> dict:
+def extract_evidence(claim: str, passage_text: str, model_name: str = "cross-encoder/nli-deberta-v3-large") -> dict:
     """
-    Given a matched claim and passage, extract the exact supporting sentence
-    and a short summary explaining the support.
-
-    Args:
-        claim:        The atomic claim to verify.
-        passage_text: Full text of the matched passage.
-        model:        LLM to use for extraction.
-
-    Returns:
-        Dict with 'extraction' (verbatim from passage) and 'summary'.
+    Extract the sentence from the passage that best supports the claim,
+    using NLI entailment scoring instead of LLM.
     """
-    from llm_client import call_llm_json
+    import numpy as np
 
-    prompt = f"""You are a strict fact-checking assistant.
+    sentences = _split_passage_into_sentences(passage_text)
+    if not sentences:
+        return {"extraction": "", "extraction_start": -1, "summary": "No sentences found."}
 
-Claim: "{claim}"
+    model = _load_nli_model(model_name)
+    pairs = [(s, claim) for s in sentences]
+    scores = model.predict(pairs)
+    scores = np.array(scores)
+    if scores.ndim == 1:
+        scores = scores.reshape(1, -1)
 
-Passage:
-\"\"\"{passage_text}\"\"\"
+    exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
+    probs = exp / exp.sum(axis=1, keepdims=True)
+    entailment_scores = probs[:, 1]
 
-Find the exact sentence(s) in the passage that DIRECTLY support the claim.
-The sentence must contain the same factual information as the claim, not just related information.
+    best_idx = int(np.argmax(entailment_scores))
+    best_score = float(entailment_scores[best_idx])
+    best_sentence = sentences[best_idx]
 
-For example:
-- Claim: "The iPhone was called 'iPhone' at release"
-- BAD extraction: "The iPhone was released on June 29, 2007" (related but different fact)
-- GOOD extraction: "it was simply called iPhone" (directly supports the naming claim)
-
-Return ONLY a JSON object:
-{{
-  "extraction": "the exact sentence(s) copied verbatim from the passage",
-  "summary": "one-sentence summary of why this supports the claim"
-}}
-
-If no sentence DIRECTLY supports the specific fact in the claim, you MUST return:
-{{"extraction": "", "summary": "No direct support found."}}
-"""
-    try:
-        result = call_llm_json(prompt, model=model)
+    if best_score >= 0.5:
+        start = passage_text.find(best_sentence)
         return {
-            "extraction": result.get("extraction", ""),
-            "summary": result.get("summary", ""),
+            "extraction": best_sentence,
+            "extraction_start": start,
+            "summary": f"Entailment score: {best_score:.3f}",
         }
-    except Exception:
-        return {"extraction": "", "summary": ""}
+
+    return {"extraction": "", "extraction_start": -1, "summary": "No direct support found."}
 
 
 # ──────────────────────────────────────────────
-# NLI-based matching
+# Sentence splitting
+# ──────────────────────────────────────────────
+
+def _split_passage_into_sentences(text: str) -> list[str]:
+    """
+    Split a passage into individual sentences.
+    
+    Handles common abbreviations and edge cases to avoid
+    bad splits on "U.S.", "Dr.", "Mr.", etc.
+    """
+    # Protect common abbreviations
+    protected = text
+    abbreviations = ["Mr.", "Mrs.", "Ms.", "Dr.", "Jr.", "Sr.", "Prof.",
+                     "Inc.", "Ltd.", "Corp.", "vs.", "etc.", "approx.",
+                     "U.S.", "U.K.", "E.U."]
+    placeholders = {}
+    for i, abbr in enumerate(abbreviations):
+        placeholder = f"__ABBR{i}__"
+        placeholders[placeholder] = abbr
+        protected = protected.replace(abbr, placeholder)
+
+    # Split on sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', protected.strip())
+
+    # Restore abbreviations
+    restored = []
+    for sent in sentences:
+        for placeholder, abbr in placeholders.items():
+            sent = sent.replace(placeholder, abbr)
+        sent = sent.strip()
+        if sent:
+            restored.append(sent)
+
+    return restored
+
+
+# ──────────────────────────────────────────────
+# NLI model loading
 # ──────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
@@ -74,6 +100,10 @@ def _load_nli_model(model_name: str):
     return CrossEncoder(model_name)
 
 
+# ──────────────────────────────────────────────
+# NLI-based matching (sentence-level)
+# ──────────────────────────────────────────────
+
 def match_with_nli(
     claim: str,
     passages: list[dict],
@@ -81,25 +111,74 @@ def match_with_nli(
     threshold: float = 0.5,
     top_k: int = 3,
 ) -> list[dict]:
+    """
+    Match a claim against passages using NLI at sentence level.
+
+    Instead of feeding entire passages to DeBERTa (which dilutes the
+    entailment signal on long texts), each passage is split into 
+    individual sentences. NLI is computed per (sentence, claim) pair
+    and the maximum entailment score across all sentences is used as
+    the passage score.
+
+    This keeps DeBERTa within its training distribution (short premise,
+    short hypothesis) and avoids false negatives on long passages.
+
+    Args:
+        claim:      The atomic claim to verify.
+        passages:   List of candidate passages.
+        model_name: NLI cross-encoder model.
+        threshold:  Minimum entailment score.
+        top_k:      Maximum passages to return.
+
+    Returns:
+        List of matching passages with entailment scores.
+    """
     if not passages:
         return []
 
-    model = _load_nli_model(model_name)
-    pairs = [(p["text"], claim) for p in passages]
-    scores = model.predict(pairs)
-
     import numpy as np
 
-    def softmax(x):
-        e = np.exp(x - np.max(x, axis=1, keepdims=True))
-        return e / e.sum(axis=1, keepdims=True)
+    model = _load_nli_model(model_name)
 
-    entailment_scores = softmax(scores)[:, 1]
+    # Build all (sentence, claim) pairs across all passages
+    # Track which passage each pair belongs to
+    all_pairs = []
+    pair_to_passage = []  # index into passages list
 
-    results = []
+    for p_idx, p in enumerate(passages):
+        sentences = _split_passage_into_sentences(p.get("text", ""))
+        if not sentences:
+            continue
+        for sent in sentences:
+            all_pairs.append((sent, claim))
+            pair_to_passage.append(p_idx)
+
+    if not all_pairs:
+        return []
+
+    # Single batched predict for all pairs
+    scores = model.predict(all_pairs)
+    scores = np.array(scores)
+    if scores.ndim == 1:
+        scores = scores.reshape(1, -1)
+
+    # Softmax per row → entailment probability (index 1)
+    exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
+    probs = exp / exp.sum(axis=1, keepdims=True)
+    entailment_scores = probs[:, 1]
+
+    # For each passage, take the max entailment score across its sentences
+    passage_best_scores = {}
     for i, score in enumerate(entailment_scores):
-        if score >= threshold:
-            results.append({**passages[i], "entailment_score": float(score)})
+        p_idx = pair_to_passage[i]
+        if p_idx not in passage_best_scores or score > passage_best_scores[p_idx]:
+            passage_best_scores[p_idx] = float(score)
+
+    # Filter by threshold and build results
+    results = []
+    for p_idx, best_score in passage_best_scores.items():
+        if best_score >= threshold:
+            results.append({**passages[p_idx], "entailment_score": best_score})
 
     results.sort(key=lambda x: x["entailment_score"], reverse=True)
     return results[:top_k]

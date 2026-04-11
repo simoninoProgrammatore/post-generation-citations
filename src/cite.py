@@ -12,15 +12,6 @@ from pathlib import Path
 
 
 def build_citation_map(matched_claims: list[dict]) -> dict:
-    """
-    Build a mapping from passage IDs to citation numbers.
-
-    Args:
-        matched_claims: List of claims with their supporting passages.
-
-    Returns:
-        A dict mapping passage_id -> citation_number (1-indexed).
-    """
     citation_map = {}
     counter = 1
 
@@ -35,7 +26,6 @@ def build_citation_map(matched_claims: list[dict]) -> dict:
 
 
 def _sentence_split(text: str) -> list[str]:
-    """Split text into sentences, handling citation markers."""
     return re.split(r'(?<=[.!?])(?:\[\d+\])*\s+', text.strip())
 
 
@@ -45,26 +35,6 @@ def insert_citations(
     citation_map: dict,
     remove_unsupported: bool = False,
 ) -> tuple[str, list[dict]]:
-    """
-    Insert inline citations into the response text.
-
-    Strategy:
-      1. Split the response into sentences.
-      2. For each sentence, find which claims it matches (word overlap).
-      3. Collect the citation numbers for those claims.
-      4. Append citation markers (e.g. [1][2]) after the sentence.
-      5. Build a reference list for all cited passages.
-
-    Args:
-        response:          Original response text.
-        matched_claims:    Claims with supporting passages.
-        citation_map:      Mapping from passage ID to citation number.
-        remove_unsupported: If True, drop sentences with no citations.
-
-    Returns:
-        Tuple of (cited_response, reference_list).
-    """
-    # Build lookup: claim text -> list of citation numbers
     claim_to_citations: dict[str, list[int]] = {}
     for mc in matched_claims:
         claim_text = mc["claim"]
@@ -88,25 +58,34 @@ def insert_citations(
         sent_words = set(re.sub(r'[^\w\s]', '', sentence.lower()).split()) - stopwords
         citation_nums: set[int] = set()
 
+        # Calcola overlap per ogni claim
+        scored_claims = []
         for claim_text, nums in claim_to_citations.items():
             claim_words = set(re.sub(r'[^\w\s]', '', claim_text.lower()).split()) - stopwords
             if not claim_words:
                 continue
             overlap = len(claim_words & sent_words) / len(claim_words)
             if overlap >= 0.5:
-                citation_nums.update(nums)
+                scored_claims.append((overlap, nums))
+
+        # Best match: prendi solo i claim nel top tier (entro 0.15 dal migliore)
+        if scored_claims:
+            scored_claims.sort(key=lambda x: x[0], reverse=True)
+            top_overlap = scored_claims[0][0]
+            for overlap, nums in scored_claims:
+                if overlap >= top_overlap - 0.15:
+                    citation_nums.update(nums)
 
         if citation_nums:
             markers = "".join(f"[{n}]" for n in sorted(citation_nums))
             cited_sentences.append(f"{sentence}{markers}")
         elif remove_unsupported:
-            pass  # drop sentence
+            pass
         else:
             cited_sentences.append(sentence)
 
     cited_response = " ".join(cited_sentences)
 
-    # Collect all passages referenced at least once
     all_passages = []
     for mc in matched_claims:
         all_passages.extend(mc["supporting_passages"])
@@ -117,12 +96,6 @@ def insert_citations(
 
 
 def build_reference_list(citation_map: dict, passages: list[dict]) -> list[dict]:
-    """
-    Build the reference list to append to the response.
-
-    Returns:
-        List of references with citation number, title, and text.
-    """
     references = []
     pid_to_passage = {p.get("id", p.get("title", "")): p for p in passages}
 
@@ -138,14 +111,6 @@ def build_reference_list(citation_map: dict, passages: list[dict]) -> list[dict]
 
 
 def run(input_path: str, output_path: str, remove_unsupported: bool = False):
-    """
-    Insert citations into all responses.
-
-    Args:
-        input_path:        Path to matched claims JSON (from Step 3).
-        output_path:       Path to save cited responses.
-        remove_unsupported: Whether to remove unsupported claims.
-    """
     with open(input_path, "r") as f:
         data = json.load(f)
 

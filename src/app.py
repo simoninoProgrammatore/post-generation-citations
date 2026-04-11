@@ -288,8 +288,33 @@ Text:
 
 def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold: float, top_k: int) -> list[dict]:
     from retrieve import match_with_nli, match_with_similarity, match_with_llm, extract_evidence
+    from retrieve import _split_passage_into_sentences, _load_nli_model
+    import numpy as np
+
     matched = []
     for claim in claims:
+        # Debug: mostra score per frase per ogni passaggio
+        if "iOS" in claim or "Macworld" in claim:
+            with st.expander(f"🔍 Score per frase: {claim[:60]}"):
+                model = _load_nli_model("cross-encoder/nli-deberta-v3-large")
+                for p_idx, p in enumerate(passages):
+                    sents = _split_passage_into_sentences(p.get("text", ""))
+                    if not sents:
+                        continue
+                    pairs = [(s, claim) for s in sents]
+                    scores = model.predict(pairs)
+                    scores = np.array(scores)
+                    if scores.ndim == 1:
+                        scores = scores.reshape(1, -1)
+                    exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
+                    probs = exp / exp.sum(axis=1, keepdims=True)
+
+                    st.write(f"**Passage [{p_idx+1}] {p.get('title', '')[:40]}**")
+                    for j, s in enumerate(sents):
+                        e_score = probs[j, 1]
+                        marker = "⭐" if e_score == max(probs[:, 1]) else ""
+                        st.caption(f"  [{j}] E={e_score:.4f} {marker} {s[:100]}")
+
         if method == "nli":
             matches = match_with_nli(claim, passages, threshold=threshold, top_k=top_k)
         elif method == "llm":
@@ -303,9 +328,7 @@ def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold
                 match["extraction"] = ev["extraction"]
                 match["summary"] = ev["summary"]
 
-        # Gate: scarta match senza evidenza concreta
         matches = [m for m in matches if m.get("extraction", "").strip()]
-
         matched.append({"claim": claim, "supporting_passages": matches})
     return matched
 
@@ -382,10 +405,11 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
                         "passages": [
                             {
                                 "title": p.get("title", "N/A"),
-                                "text": p.get("text", ""),
+                                "text": p.get("text", ""),          # testo completo
                                 "score": p.get("entailment_score", p.get("similarity_score", 0)),
                                 "cite_num": citation_map.get(p.get("id") or p.get("title", ""), "?"),
                                 "extraction": p.get("extraction", ""),
+                                "extraction_start": p.get("extraction_start", -1),  # posizione
                             }
                             for p in passages
                         ]
@@ -479,11 +503,14 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
         const dataMap = {{}};
         sentenceData.forEach(s => dataMap[s.idx] = s);
 
-        function highlightEvidence(fullText, extraction, passageId) {{
+        function highlightEvidence(fullText, extraction, extractionStart, passageId) {{
             if (!extraction || !extraction.trim()) {{
                 return '<span class="passage-text">' + fullText + '</span>';
             }}
-            let idx = fullText.indexOf(extraction);
+
+            // Usa la posizione pre-calcolata se disponibile
+            let idx = (extractionStart >= 0) ? extractionStart : fullText.indexOf(extraction);
+
             if (idx !== -1) {{
                 const before = fullText.substring(0, idx);
                 const match = fullText.substring(idx, idx + extraction.length);
@@ -492,6 +519,8 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
                     '<span class="evidence-highlight" id="ev-' + passageId + '">' + match + '</span>' +
                     after + '</span>';
             }}
+
+            // Fallback: word overlap sui sentence
             const extWords = extraction.toLowerCase().split(/\s+/);
             const sents = fullText.split(/(?<=[.!?])\s+/);
             let bestSent = '', bestScore = 0;
@@ -503,11 +532,9 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
             if (bestScore >= 0.5 && bestSent) {{
                 const bIdx = fullText.indexOf(bestSent);
                 if (bIdx !== -1) {{
-                    const before = fullText.substring(0, bIdx);
-                    const after = fullText.substring(bIdx + bestSent.length);
-                    return '<span class="passage-text">' + before +
+                    return '<span class="passage-text">' + fullText.substring(0, bIdx) +
                         '<span class="evidence-highlight" id="ev-' + passageId + '">' + bestSent + '</span>' +
-                        after + '</span>';
+                        fullText.substring(bIdx + bestSent.length) + '</span>';
                 }}
             }}
             return '<span class="passage-text">' + fullText + '</span>';
@@ -534,7 +561,12 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
             wrapper.appendChild(label);
             claim.passages.forEach((p, pIdx) => {{
                 const passageId = sentIdx + '-' + claimIdx + '-' + pIdx;
-                const highlighted = highlightEvidence(p.text, p.extraction || '', passageId);
+                const highlighted = highlightEvidence(
+                    p.text,
+                    p.extraction || '',
+                    p.extraction_start ?? -1,
+                    passageId
+                );
                 const card = document.createElement('div');
                 card.className = 'passage-card';
                 card.innerHTML = `
