@@ -35,8 +35,8 @@ def build_citation_map(matched_claims: list[dict]) -> dict:
 
 
 def _sentence_split(text: str) -> list[str]:
-    """Split text into sentences, preserving trailing whitespace."""
-    return re.split(r'(?<=[.!?])\s+', text.strip())
+    """Split text into sentences, handling citation markers."""
+    return re.split(r'(?<=[.!?])(?:\[\d+\])*\s+', text.strip())
 
 
 def insert_citations(
@@ -50,7 +50,7 @@ def insert_citations(
 
     Strategy:
       1. Split the response into sentences.
-      2. For each sentence, find which claims it contains (substring match).
+      2. For each sentence, find which claims it matches (word overlap).
       3. Collect the citation numbers for those claims.
       4. Append citation markers (e.g. [1][2]) after the sentence.
       5. Build a reference list for all cited passages.
@@ -64,7 +64,7 @@ def insert_citations(
     Returns:
         Tuple of (cited_response, reference_list).
     """
-    # Build a quick lookup: claim text -> list of citation numbers
+    # Build lookup: claim text -> list of citation numbers
     claim_to_citations: dict[str, list[int]] = {}
     for mc in matched_claims:
         claim_text = mc["claim"]
@@ -76,18 +76,24 @@ def insert_citations(
         if nums:
             claim_to_citations[claim_text] = sorted(set(nums))
 
+    stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on',
+                 'at', 'to', 'for', 'of', 'and', 'or', 'but', 'with', 'as',
+                 'his', 'her', 'their', 'its', 'has', 'have', 'had', 'by',
+                 'it', 'this', 'that', 'from', 'not', 'be', 'been'}
+
     sentences = _sentence_split(response)
     cited_sentences = []
 
     for sentence in sentences:
-        sentence_lower = sentence.lower()
+        sent_words = set(re.sub(r'[^\w\s]', '', sentence.lower()).split()) - stopwords
         citation_nums: set[int] = set()
 
         for claim_text, nums in claim_to_citations.items():
-            # Check if any meaningful fragment of the claim appears in the sentence
-            # (use the first 60 chars as a fingerprint to handle minor wording diffs)
-            fragment = claim_text[:60].lower().rstrip(".,;")
-            if fragment and fragment in sentence_lower:
+            claim_words = set(re.sub(r'[^\w\s]', '', claim_text.lower()).split()) - stopwords
+            if not claim_words:
+                continue
+            overlap = len(claim_words & sent_words) / len(claim_words)
+            if overlap >= 0.5:
                 citation_nums.update(nums)
 
         if citation_nums:

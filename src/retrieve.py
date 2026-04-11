@@ -12,6 +12,59 @@ from functools import lru_cache
 
 
 # ──────────────────────────────────────────────
+# Evidence extraction
+# ──────────────────────────────────────────────
+
+def extract_evidence(claim: str, passage_text: str, model: str = "claude-haiku-4-5-20251001") -> dict:
+    """
+    Given a matched claim and passage, extract the exact supporting sentence
+    and a short summary explaining the support.
+
+    Args:
+        claim:        The atomic claim to verify.
+        passage_text: Full text of the matched passage.
+        model:        LLM to use for extraction.
+
+    Returns:
+        Dict with 'extraction' (verbatim from passage) and 'summary'.
+    """
+    from llm_client import call_llm_json
+
+    prompt = f"""You are a strict fact-checking assistant.
+
+Claim: "{claim}"
+
+Passage:
+\"\"\"{passage_text}\"\"\"
+
+Find the exact sentence(s) in the passage that DIRECTLY support the claim.
+The sentence must contain the same factual information as the claim, not just related information.
+
+For example:
+- Claim: "The iPhone was called 'iPhone' at release"
+- BAD extraction: "The iPhone was released on June 29, 2007" (related but different fact)
+- GOOD extraction: "it was simply called iPhone" (directly supports the naming claim)
+
+Return ONLY a JSON object:
+{{
+  "extraction": "the exact sentence(s) copied verbatim from the passage",
+  "summary": "one-sentence summary of why this supports the claim"
+}}
+
+If no sentence DIRECTLY supports the specific fact in the claim, you MUST return:
+{{"extraction": "", "summary": "No direct support found."}}
+"""
+    try:
+        result = call_llm_json(prompt, model=model)
+        return {
+            "extraction": result.get("extraction", ""),
+            "summary": result.get("summary", ""),
+        }
+    except Exception:
+        return {"extraction": "", "summary": ""}
+
+
+# ──────────────────────────────────────────────
 # NLI-based matching
 # ──────────────────────────────────────────────
 
@@ -146,7 +199,17 @@ Passages:
 # Runner
 # ──────────────────────────────────────────────
 
-def run(input_path: str, output_path: str, method: str = "nli"):
+def run(input_path: str, output_path: str, method: str = "nli", extract: bool = True):
+    """
+    Match claims to evidence passages and optionally extract
+    the exact supporting sentence from each passage.
+
+    Args:
+        input_path:  Path to claims JSON (from Step 2).
+        output_path: Path to save matched claims.
+        method:      Matching method ('nli', 'similarity', 'llm').
+        extract:     If True, run LLM extraction on each match.
+    """
     with open(input_path, "r") as f:
         data = json.load(f)
 
@@ -162,6 +225,16 @@ def run(input_path: str, output_path: str, method: str = "nli"):
 
         for claim in example["claims"]:
             matches = match_fn(claim, passages)
+
+            if extract:
+                for match in matches:
+                    ev = extract_evidence(claim, match.get("text", ""))
+                    match["extraction"] = ev["extraction"]
+                    match["summary"] = ev["summary"]
+
+                # Gate: scarta match senza evidenza concreta
+                matches = [m for m in matches if m.get("extraction", "").strip()]
+
             matched_claims.append({
                 "claim": claim,
                 "supporting_passages": matches,
@@ -188,5 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, required=True)
     parser.add_argument("--output", type=str, default="results/matched.json")
     parser.add_argument("--method", type=str, default="nli", choices=["nli", "similarity", "llm"])
+    parser.add_argument("--no-extract", action="store_true",
+                        help="Skip LLM evidence extraction")
     args = parser.parse_args()
-    run(args.input, args.output, args.method)
+    run(args.input, args.output, args.method, extract=not args.no_extract)
