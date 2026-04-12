@@ -16,16 +16,29 @@ from functools import lru_cache
 # Evidence extraction
 # ──────────────────────────────────────────────
 
-def extract_evidence(claim: str, passage_text: str, model_name: str = "cross-encoder/nli-deberta-v3-large") -> dict:
+def extract_evidence(claim: str, passage_text: str, best_sentence: str = "",
+                     extraction_start: int = -1, extraction_end: int = -1,
+                     model_name: str = "cross-encoder/nli-deberta-v3-large") -> dict:
     """
-    Extract the sentence from the passage that best supports the claim,
-    using NLI entailment scoring instead of LLM.
+    Extract the supporting sentence from the passage.
+    If best_sentence and span are provided (from match_with_nli), use them directly.
+    Otherwise fall back to NLI scoring.
     """
+    # Se abbiamo già span dal matching, usali direttamente
+    if best_sentence and extraction_start >= 0:
+        return {
+            "extraction": best_sentence,
+            "extraction_start": extraction_start,
+            "extraction_end": extraction_end,
+            "summary": f"Matched at [{extraction_start}:{extraction_end}]",
+        }
+
+    # Fallback per similarity/llm methods
     import numpy as np
 
     sentences = _split_passage_into_sentences(passage_text)
     if not sentences:
-        return {"extraction": "", "extraction_start": -1, "summary": "No sentences found."}
+        return {"extraction": "", "extraction_start": -1, "extraction_end": -1, "summary": "No sentences found."}
 
     model = _load_nli_model(model_name)
     pairs = [(s, claim) for s in sentences]
@@ -33,7 +46,6 @@ def extract_evidence(claim: str, passage_text: str, model_name: str = "cross-enc
     scores = np.array(scores)
     if scores.ndim == 1:
         scores = scores.reshape(1, -1)
-
     exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
     probs = exp / exp.sum(axis=1, keepdims=True)
     entailment_scores = probs[:, 1]
@@ -42,15 +54,18 @@ def extract_evidence(claim: str, passage_text: str, model_name: str = "cross-enc
     best_score = float(entailment_scores[best_idx])
     best_sentence = sentences[best_idx]
 
-    if best_score >= 0.5:
-        start = passage_text.find(best_sentence)
-        return {
-            "extraction": best_sentence,
-            "extraction_start": start,
-            "summary": f"Entailment score: {best_score:.3f}",
-        }
+    if best_score < 0.5:
+        return {"extraction": "", "extraction_start": -1, "extraction_end": -1, "summary": "No direct support found."}
 
-    return {"extraction": "", "extraction_start": -1, "summary": "No direct support found."}
+    start = passage_text.find(best_sentence)
+    end = start + len(best_sentence) if start != -1 else -1
+
+    return {
+        "extraction": best_sentence,
+        "extraction_start": start,
+        "extraction_end": end,
+        "summary": f"Entailment score: {best_score:.3f}",
+    }
 
 
 # ──────────────────────────────────────────────
@@ -60,11 +75,8 @@ def extract_evidence(claim: str, passage_text: str, model_name: str = "cross-enc
 def _split_passage_into_sentences(text: str) -> list[str]:
     """
     Split a passage into individual sentences.
-    
-    Handles common abbreviations and edge cases to avoid
-    bad splits on "U.S.", "Dr.", "Mr.", etc.
+    Kept for backward compatibility with similarity/llm methods.
     """
-    # Protect common abbreviations
     protected = text
     abbreviations = ["Mr.", "Mrs.", "Ms.", "Dr.", "Jr.", "Sr.", "Prof.",
                      "Inc.", "Ltd.", "Corp.", "vs.", "etc.", "approx.",
@@ -75,10 +87,8 @@ def _split_passage_into_sentences(text: str) -> list[str]:
         placeholders[placeholder] = abbr
         protected = protected.replace(abbr, placeholder)
 
-    # Split on sentence boundaries
     sentences = re.split(r'(?<=[.!?])\s+', protected.strip())
 
-    # Restore abbreviations
     restored = []
     for sent in sentences:
         for placeholder, abbr in placeholders.items():
@@ -88,6 +98,42 @@ def _split_passage_into_sentences(text: str) -> list[str]:
             restored.append(sent)
 
     return restored
+
+
+def _split_passage_with_spans(text: str) -> list[tuple[str, int, int]]:
+    """
+    Split a passage into sentences, returning (sentence, start, end) tuples
+    with positions relative to the original text.
+    """
+    abbreviations = ["Mr.", "Mrs.", "Ms.", "Dr.", "Jr.", "Sr.", "Prof.",
+                     "Inc.", "Ltd.", "Corp.", "vs.", "etc.", "approx.",
+                     "U.S.", "U.K.", "E.U."]
+
+    protected = text
+    placeholders = {}
+    for i, abbr in enumerate(abbreviations):
+        placeholder = f"__ABBR{i}__"
+        placeholders[placeholder] = abbr
+        protected = protected.replace(abbr, placeholder)
+
+    results = []
+    for match in re.finditer(r'[^.!?]*[.!?]+', protected):
+        sent_protected = match.group().strip()
+        if not sent_protected:
+            continue
+
+        start = match.start()
+        end = match.end()
+
+        original_sent = text[start:end].strip()
+
+        stripped_start = start + (len(text[start:end]) - len(text[start:end].lstrip()))
+        stripped_end = stripped_start + len(original_sent)
+
+        if original_sent:
+            results.append((original_sent, stripped_start, stripped_end))
+
+    return results
 
 
 # ──────────────────────────────────────────────
@@ -111,28 +157,6 @@ def match_with_nli(
     threshold: float = 0.5,
     top_k: int = 3,
 ) -> list[dict]:
-    """
-    Match a claim against passages using NLI at sentence level.
-
-    Instead of feeding entire passages to DeBERTa (which dilutes the
-    entailment signal on long texts), each passage is split into 
-    individual sentences. NLI is computed per (sentence, claim) pair
-    and the maximum entailment score across all sentences is used as
-    the passage score.
-
-    This keeps DeBERTa within its training distribution (short premise,
-    short hypothesis) and avoids false negatives on long passages.
-
-    Args:
-        claim:      The atomic claim to verify.
-        passages:   List of candidate passages.
-        model_name: NLI cross-encoder model.
-        threshold:  Minimum entailment score.
-        top_k:      Maximum passages to return.
-
-    Returns:
-        List of matching passages with entailment scores.
-    """
     if not passages:
         return []
 
@@ -140,45 +164,51 @@ def match_with_nli(
 
     model = _load_nli_model(model_name)
 
-    # Build all (sentence, claim) pairs across all passages
-    # Track which passage each pair belongs to
     all_pairs = []
-    pair_to_passage = []  # index into passages list
+    pair_to_passage = []
+    pair_to_span = []  # (sentence_text, start, end)
 
     for p_idx, p in enumerate(passages):
-        sentences = _split_passage_into_sentences(p.get("text", ""))
-        if not sentences:
+        spans = _split_passage_with_spans(p.get("text", ""))
+        if not spans:
             continue
-        for sent in sentences:
+        for sent, start, end in spans:
             all_pairs.append((sent, claim))
             pair_to_passage.append(p_idx)
+            pair_to_span.append((sent, start, end))
 
     if not all_pairs:
         return []
 
-    # Single batched predict for all pairs
     scores = model.predict(all_pairs)
     scores = np.array(scores)
     if scores.ndim == 1:
         scores = scores.reshape(1, -1)
 
-    # Softmax per row → entailment probability (index 1)
     exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
     probs = exp / exp.sum(axis=1, keepdims=True)
     entailment_scores = probs[:, 1]
+    
 
-    # For each passage, take the max entailment score across its sentences
-    passage_best_scores = {}
+    
+    # Per ogni passaggio, traccia score migliore E span corrispondente
+    passage_best: dict[int, tuple[float, str, int, int]] = {}
     for i, score in enumerate(entailment_scores):
         p_idx = pair_to_passage[i]
-        if p_idx not in passage_best_scores or score > passage_best_scores[p_idx]:
-            passage_best_scores[p_idx] = float(score)
+        sent, start, end = pair_to_span[i]
+        if p_idx not in passage_best or score > passage_best[p_idx][0]:
+            passage_best[p_idx] = (float(score), sent, start, end)
 
-    # Filter by threshold and build results
     results = []
-    for p_idx, best_score in passage_best_scores.items():
+    for p_idx, (best_score, best_sent, start, end) in passage_best.items():
         if best_score >= threshold:
-            results.append({**passages[p_idx], "entailment_score": best_score})
+            results.append({
+                **passages[p_idx],
+                "entailment_score": best_score,
+                "best_sentence": best_sent,
+                "extraction_start": start,
+                "extraction_end": end,
+            })
 
     results.sort(key=lambda x: x["entailment_score"], reverse=True)
     return results[:top_k]
@@ -235,7 +265,7 @@ def match_with_llm(
     if not candidates:
         return []
 
-    # Step 2: Claude re-ranking
+    # Step 2: LLM re-ranking + extraction in un'unica chiamata
     passages_text = "\n\n".join([
         f"[{i}] {p.get('title', 'N/A')}: {p.get('text', '')[:500]}"
         for i, p in enumerate(candidates)
@@ -246,8 +276,13 @@ def match_with_llm(
 Claim: "{claim}"
 
 For each passage below, decide if it SUPPORTS the claim (entails it), CONTRADICTS it, or is NEUTRAL.
+If it SUPPORTS, extract the EXACT sentence from the passage that best supports the claim.
+Copy the sentence verbatim — do not paraphrase.
+
 Return ONLY a JSON array like:
-[{{"idx": 0, "label": "supports", "score": 0.95}}, ...]
+[{{"idx": 0, "label": "supports", "score": 0.95, "evidence": "The exact sentence from the passage."}}, ...]
+
+For non-supporting passages, set "evidence" to "".
 
 Passages:
 {passages_text}
@@ -268,7 +303,24 @@ Passages:
             and r.get("score", 0) >= threshold
         ):
             p = candidates[idx]
-            scored.append({**p, "entailment_score": float(r["score"])})
+            evidence = r.get("evidence", "").strip()
+            passage_text = p.get("text", "")
+
+            # Trova lo span dell'evidenza nel passaggio
+            extraction_start = -1
+            extraction_end = -1
+            if evidence:
+                extraction_start = passage_text.find(evidence)
+                if extraction_start != -1:
+                    extraction_end = extraction_start + len(evidence)
+
+            scored.append({
+                **p,
+                "entailment_score": float(r["score"]),
+                "best_sentence": evidence,
+                "extraction_start": extraction_start,
+                "extraction_end": extraction_end,
+            })
 
     scored.sort(key=lambda x: x["entailment_score"], reverse=True)
     return scored[:top_k]
@@ -287,7 +339,7 @@ def run(input_path: str, output_path: str, method: str = "nli", extract: bool = 
         input_path:  Path to claims JSON (from Step 2).
         output_path: Path to save matched claims.
         method:      Matching method ('nli', 'similarity', 'llm').
-        extract:     If True, run LLM extraction on each match.
+        extract:     If True, run evidence extraction on each match.
     """
     with open(input_path, "r") as f:
         data = json.load(f)
@@ -307,11 +359,18 @@ def run(input_path: str, output_path: str, method: str = "nli", extract: bool = 
 
             if extract:
                 for match in matches:
-                    ev = extract_evidence(claim, match.get("text", ""))
+                    ev = extract_evidence(
+                        claim,
+                        match.get("text", ""),
+                        best_sentence=match.get("best_sentence", ""),
+                        extraction_start=match.get("extraction_start", -1),
+                        extraction_end=match.get("extraction_end", -1),
+                    )
                     match["extraction"] = ev["extraction"]
+                    match["extraction_start"] = ev["extraction_start"]
+                    match["extraction_end"] = ev["extraction_end"]
                     match["summary"] = ev["summary"]
 
-                # Gate: scarta match senza evidenza concreta
                 matches = [m for m in matches if m.get("extraction", "").strip()]
 
             matched_claims.append({
@@ -341,6 +400,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="results/matched.json")
     parser.add_argument("--method", type=str, default="nli", choices=["nli", "similarity", "llm"])
     parser.add_argument("--no-extract", action="store_true",
-                        help="Skip LLM evidence extraction")
+                        help="Skip evidence extraction")
     args = parser.parse_args()
     run(args.input, args.output, args.method, extract=not args.no_extract)

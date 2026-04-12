@@ -288,32 +288,11 @@ Text:
 
 def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold: float, top_k: int) -> list[dict]:
     from retrieve import match_with_nli, match_with_similarity, match_with_llm, extract_evidence
-    from retrieve import _split_passage_into_sentences, _load_nli_model
+    from retrieve import _split_passage_with_spans, _load_nli_model
     import numpy as np
 
     matched = []
     for claim in claims:
-        # Debug: mostra score per frase per ogni passaggio
-        if "iOS" in claim or "Macworld" in claim:
-            with st.expander(f"🔍 Score per frase: {claim[:60]}"):
-                model = _load_nli_model("cross-encoder/nli-deberta-v3-large")
-                for p_idx, p in enumerate(passages):
-                    sents = _split_passage_into_sentences(p.get("text", ""))
-                    if not sents:
-                        continue
-                    pairs = [(s, claim) for s in sents]
-                    scores = model.predict(pairs)
-                    scores = np.array(scores)
-                    if scores.ndim == 1:
-                        scores = scores.reshape(1, -1)
-                    exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
-                    probs = exp / exp.sum(axis=1, keepdims=True)
-
-                    st.write(f"**Passage [{p_idx+1}] {p.get('title', '')[:40]}**")
-                    for j, s in enumerate(sents):
-                        e_score = probs[j, 1]
-                        marker = "⭐" if e_score == max(probs[:, 1]) else ""
-                        st.caption(f"  [{j}] E={e_score:.4f} {marker} {s[:100]}")
 
         if method == "nli":
             matches = match_with_nli(claim, passages, threshold=threshold, top_k=top_k)
@@ -323,15 +302,21 @@ def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold
             matches = match_with_similarity(claim, passages, top_k=top_k)
 
         for match in matches:
-            if not match.get("extraction"):
-                ev = extract_evidence(claim, match.get("text", ""))
-                match["extraction"] = ev["extraction"]
-                match["summary"] = ev["summary"]
+            ev = extract_evidence(
+                claim,
+                match.get("text", ""),
+                best_sentence=match.get("best_sentence", ""),
+                extraction_start=match.get("extraction_start", -1),
+                extraction_end=match.get("extraction_end", -1),
+            )
+            match["extraction"] = ev["extraction"]
+            match["extraction_start"] = ev["extraction_start"]
+            match["extraction_end"] = ev["extraction_end"]
+            match["summary"] = ev["summary"]
 
         matches = [m for m in matches if m.get("extraction", "").strip()]
         matched.append({"claim": claim, "supporting_passages": matches})
     return matched
-
 
 def run_cite(response: str, matched_claims: list[dict]) -> tuple[str, list[dict]]:
     from cite import build_citation_map, insert_citations
@@ -405,11 +390,12 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
                         "passages": [
                             {
                                 "title": p.get("title", "N/A"),
-                                "text": p.get("text", ""),          # testo completo
+                                "text": p.get("text", ""),
                                 "score": p.get("entailment_score", p.get("similarity_score", 0)),
                                 "cite_num": citation_map.get(p.get("id") or p.get("title", ""), "?"),
                                 "extraction": p.get("extraction", ""),
-                                "extraction_start": p.get("extraction_start", -1),  # posizione
+                                "extraction_start": p.get("extraction_start", -1),
+                                "extraction_end": p.get("extraction_end", -1),
                             }
                             for p in passages
                         ]
@@ -503,18 +489,18 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
         const dataMap = {{}};
         sentenceData.forEach(s => dataMap[s.idx] = s);
 
-        function highlightEvidence(fullText, extraction, extractionStart, passageId) {{
+        function highlightEvidence(fullText, extraction, extractionStart, extractionEnd, passageId) {{
             if (!extraction || !extraction.trim()) {{
                 return '<span class="passage-text">' + fullText + '</span>';
             }}
 
-            // Usa la posizione pre-calcolata se disponibile
             let idx = (extractionStart >= 0) ? extractionStart : fullText.indexOf(extraction);
+            let endIdx = (extractionEnd >= 0) ? extractionEnd : (idx !== -1 ? idx + extraction.length : -1);
 
-            if (idx !== -1) {{
+            if (idx !== -1 && endIdx !== -1) {{
                 const before = fullText.substring(0, idx);
-                const match = fullText.substring(idx, idx + extraction.length);
-                const after = fullText.substring(idx + extraction.length);
+                const match = fullText.substring(idx, endIdx);
+                const after = fullText.substring(endIdx);
                 return '<span class="passage-text">' + before +
                     '<span class="evidence-highlight" id="ev-' + passageId + '">' + match + '</span>' +
                     after + '</span>';
@@ -565,6 +551,7 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
                     p.text,
                     p.extraction || '',
                     p.extraction_start ?? -1,
+                    p.extraction_end ?? -1,
                     passageId
                 );
                 const card = document.createElement('div');
