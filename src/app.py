@@ -257,15 +257,33 @@ def get_embedding_model(model_name: str):
 # Pipeline functions
 # ──────────────────────────────────────────────
 
-def run_generate(query: str, model: str) -> str:
+def run_generate(query: str, model: str, passages: list[dict] = None) -> str:
     from llm_client import call_llm
-    prompt = (
-        "You are a knowledgeable assistant. "
-        "Answer the question clearly and factually in plain text. "
-        "Do NOT use markdown formatting, headers, or bullet points. "
-        "Do NOT include any citations or references in your response.\n\n"
-        f"Question: {query}\n\nAnswer:"
-    )
+
+    if passages:
+        passages_text = "\n\n".join([
+            f"[{i+1}] {p.get('title', 'N/A')}:\n{p.get('text', '')}"
+            for i, p in enumerate(passages[:10])
+        ])
+        prompt = (
+            "You are a knowledgeable assistant. "
+            "Answer the question ONLY using the information provided in the passages below. "
+            "Do NOT use any external knowledge. "
+            "If the passages do not contain enough information to answer, say so. "
+            "Do NOT include any citations or references in your response. "
+            "Write in plain text without markdown formatting.\n\n"
+            f"Passages:\n{passages_text}\n\n"
+            f"Question: {query}\n\nAnswer:"
+        )
+    else:
+        prompt = (
+            "You are a knowledgeable assistant. "
+            "Answer the question clearly and factually in plain text. "
+            "Do NOT use markdown formatting, headers, or bullet points. "
+            "Do NOT include any citations or references in your response.\n\n"
+            f"Question: {query}\n\nAnswer:"
+        )
+
     return call_llm(prompt, model=model)
 
 
@@ -288,12 +306,9 @@ Text:
 
 def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold: float, top_k: int) -> list[dict]:
     from retrieve import match_with_nli, match_with_similarity, match_with_llm, extract_evidence
-    from retrieve import _split_passage_with_spans, _load_nli_model
-    import numpy as np
 
     matched = []
     for claim in claims:
-
         if method == "nli":
             matches = match_with_nli(claim, passages, threshold=threshold, top_k=top_k)
         elif method == "llm":
@@ -317,6 +332,7 @@ def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold
         matches = [m for m in matches if m.get("extraction", "").strip()]
         matched.append({"claim": claim, "supporting_passages": matches})
     return matched
+
 
 def run_cite(response: str, matched_claims: list[dict]) -> tuple[str, list[dict]]:
     from cite import build_citation_map, insert_citations
@@ -506,7 +522,6 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
                     after + '</span>';
             }}
 
-            // Fallback: word overlap sui sentence
             const extWords = extraction.toLowerCase().split(/\s+/);
             const sents = fullText.split(/(?<=[.!?])\s+/);
             let bestSent = '', bestScore = 0;
@@ -694,7 +709,7 @@ if page == "🔬 Pipeline interattivo":
         else:
             with st.spinner("Generazione risposta..."):
                 try:
-                    response = run_generate(query, model)
+                    response = run_generate(query, model, passages=passages if passages else None)
                     st.session_state["response"] = response
                     st.session_state["query"] = query
                     st.session_state["passages"] = passages

@@ -1,8 +1,9 @@
 """
-Step 1: Generate LLM responses to queries (without citations).
+Step 1: Generate LLM responses to queries (with optional RAG).
 
-Given a query from the ALCE dataset, this module produces a raw 
-LLM response that will later be augmented with citations.
+Given a query and optionally a set of passages from the ALCE dataset,
+this module produces a raw LLM response that will later be augmented
+with citations.
 """
 
 import json
@@ -18,6 +19,14 @@ SYSTEM_PROMPT = (
     "Do NOT include any citations or references in your response."
 )
 
+RAG_SYSTEM_PROMPT = (
+    "You are a knowledgeable assistant. "
+    "Answer the question ONLY using the information provided in the passages below. "
+    "Do NOT use any external knowledge. "
+    "If the passages do not contain enough information to answer, say so. "
+    "Do NOT include any citations or references in your response."
+)
+
 
 def load_dataset(dataset_path: str) -> list[dict]:
     """Load ALCE dataset from JSON file."""
@@ -26,19 +35,33 @@ def load_dataset(dataset_path: str) -> list[dict]:
     return data
 
 
-def generate_response(query: str, model: str = "gemini-2.0-flash", max_tokens: int = 300) -> str:
+def generate_response(query: str, passages: list[dict] = None,
+                      model: str = "gemini-2.0-flash", max_tokens: int = 300) -> str:
     """
     Generate a response to a query using the specified LLM.
 
     Args:
         query:      The input question.
+        passages:   Optional list of passages to ground the response.
         model:      Model identifier (e.g. 'gemini-2.0-flash').
         max_tokens: Maximum number of tokens in the response.
 
     Returns:
         The generated response text (without citations).
     """
-    prompt = f"{SYSTEM_PROMPT}\n\nQuestion: {query}\n\nAnswer:"
+    if passages:
+        passages_text = "\n\n".join([
+            f"[{i+1}] {p.get('title', 'N/A')}:\n{p.get('text', '')}"
+            for i, p in enumerate(passages[:10])
+        ])
+        prompt = (
+            f"{RAG_SYSTEM_PROMPT}\n\n"
+            f"Passages:\n{passages_text}\n\n"
+            f"Question: {query}\n\nAnswer:"
+        )
+    else:
+        prompt = f"{SYSTEM_PROMPT}\n\nQuestion: {query}\n\nAnswer:"
+
     return call_llm(prompt, model=model, max_tokens=max_tokens)
 
 
@@ -56,11 +79,12 @@ def run(dataset_path: str, output_path: str, model: str = "gemini-2.0-flash"):
 
     for example in data:
         query = example["question"]
-        response = generate_response(query, model=model)
+        passages = example.get("docs", [])
+        response = generate_response(query, passages=passages, model=model)
         results.append({
             "question": query,
             "raw_response": response,
-            "passages": example.get("docs", []),
+            "passages": passages,
         })
 
     output = Path(output_path)
