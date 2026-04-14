@@ -8,12 +8,12 @@ This project is part of a Bachelor's thesis on evidence-based text generation wi
 
 ```
 Query ──► LLM ──► Raw Response ──► Decompose ──► Retrieve ──► Cite ──► Cited Response
-                  (no citations)    (claims)      (evidence)   ([1][2])  (with citations)
+                (pool retrieval)    (claims)    (evidence)   ([1][2])  (with citations)
 ```
 
 ### Pipeline Steps
 
-1. **Generate** — An LLM produces a response to a query (no citations).
+1. **Generate** — An LLM produces a response to a query (citing ALCE passages).
 2. **Decompose** — The response is broken into atomic claims (inspired by [FActScore](https://arxiv.org/abs/2305.14627), Min et al. 2023).
 3. **Retrieve** — For each claim, matching evidence passages are found from the provided corpus.
 4. **Cite** — Inline citations are inserted into the response, linking each claim to its supporting passage(s).
