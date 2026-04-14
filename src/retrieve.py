@@ -156,7 +156,8 @@ def match_with_nli(
     model_name: str = "cross-encoder/nli-deberta-v3-large",
     threshold: float = 0.5,
     top_k: int = 3,
-) -> list[dict]:
+    return_all_scores: bool = False,   # ← nuovo parametro
+) -> list[dict] | tuple[list[dict], list[dict]]:
     if not passages:
         return []
 
@@ -211,6 +212,29 @@ def match_with_nli(
             })
 
     results.sort(key=lambda x: x["entailment_score"], reverse=True)
+    
+    if return_all_scores:
+        # Costruisci struttura debug per la UI
+        all_scores_by_passage: dict[int, list[dict]] = {}
+        for i, score in enumerate(entailment_scores):
+            p_idx = pair_to_passage[i]
+            sent, start, end = pair_to_span[i]
+            best_score_for_passage = passage_best.get(p_idx, (0,))[0]
+            all_scores_by_passage.setdefault(p_idx, []).append({
+                "text": sent,
+                "score": float(score),
+                "is_best": float(score) == best_score_for_passage,
+            })
+
+        sentence_scores = [
+            {
+                "title": passages[p_idx].get("title", f"Passage {p_idx}"),
+                "sentences": sents,
+            }
+            for p_idx, sents in all_scores_by_passage.items()
+        ]
+        return results[:top_k], sentence_scores
+
     return results[:top_k]
 
 

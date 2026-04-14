@@ -178,6 +178,14 @@ st.markdown("""
         color: #1E293B;
         margin-bottom: 12px;
     }
+
+    .debug-sentence-row {
+        margin: 3px 0;
+        padding: 6px 10px;
+        border-radius: 6px;
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -235,6 +243,84 @@ def support_badge(has_support: bool) -> str:
     if has_support:
         return '<span class="support-yes">✓ Supported</span>'
     return '<span class="support-no">✗ Unsupported</span>'
+
+
+def render_nli_debug(debug_data: list[dict]):
+    """Renderizza il pannello debug NLI con tutti gli entailment scores per frase."""
+    st.markdown("#### 🔬 Debug NLI — Entailment scores per frase")
+    st.caption("Per ogni claim, mostra lo score di entailment di ogni frase di ogni passaggio candidato.")
+
+    for debug_item in debug_data:
+        claim_text = debug_item["claim"]
+        sentence_scores = debug_item.get("sentence_scores", [])
+
+        if not sentence_scores:
+            continue
+
+        # Conta quante frasi superano threshold
+        all_sents = [s for p in sentence_scores for s in p["sentences"]]
+        best_overall = max((s["score"] for s in all_sents), default=0)
+
+        with st.expander(
+            f"📌 {claim_text[:85]}{'...' if len(claim_text) > 85 else ''}  "
+            f"— best score: `{best_overall:.4f}`"
+        ):
+            for passage_entry in sentence_scores:
+                p_title = passage_entry["title"]
+                sents = passage_entry["sentences"]
+
+                st.markdown(f"**📄 {p_title}**")
+
+                # Ordina per score decrescente
+                for s in sorted(sents, key=lambda x: x["score"], reverse=True):
+                    score = s["score"]
+                    is_best = s["is_best"]
+
+                    # Colore basato sullo score
+                    if score >= 0.7:
+                        color = "#10B981"
+                        bg = "#F0FDF4"
+                        border = "#86EFAC"
+                    elif score >= 0.4:
+                        color = "#F59E0B"
+                        bg = "#FFFBEB"
+                        border = "#FCD34D"
+                    else:
+                        color = "#94A3B8"
+                        bg = "#F8FAFC"
+                        border = "#E2E8F0"
+
+                    # Barra proporzionale (max 25 caratteri)
+                    bar_filled = int(score * 25)
+                    bar_empty = 25 - bar_filled
+                    bar_html = (
+                        f'<span style="color:{color};">{"█" * bar_filled}</span>'
+                        f'<span style="color:#E2E8F0;">{"█" * bar_empty}</span>'
+                    )
+
+                    best_badge = (
+                        '<span style="background:#DCFCE7;color:#166534;font-size:10px;'
+                        'font-weight:700;padding:1px 7px;border-radius:20px;margin-left:6px;">⭐ BEST</span>'
+                        if is_best else ""
+                    )
+
+                    sentence_preview = s["text"][:140] + ("…" if len(s["text"]) > 140 else "")
+
+                    st.markdown(
+                        f'<div style="margin:4px 0; padding:8px 12px; border-radius:7px; '
+                        f'background:{bg}; border:1px solid {border}; font-size:13px;">'
+                        f'<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">'
+                        f'<span style="font-family:\'JetBrains Mono\',monospace; font-weight:700; color:{color}; font-size:13px;">'
+                        f'[{score:.4f}]</span>'
+                        f'<span style="font-family:\'JetBrains Mono\',monospace; font-size:12px;">{bar_html}</span>'
+                        f'{best_badge}'
+                        f'</div>'
+                        f'<div style="color:#475569; line-height:1.5;">"{sentence_preview}"</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                st.divider()
 
 
 # ──────────────────────────────────────────────
@@ -304,13 +390,30 @@ Text:
     return call_llm_json(prompt, model=model)
 
 
-def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold: float, top_k: int) -> list[dict]:
+def run_retrieve(
+    claims: list[str],
+    passages: list[dict],
+    method: str,
+    threshold: float,
+    top_k: int,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Restituisce (matched, debug_data).
+    debug_data è una lista di dict con 'claim' e 'sentence_scores'
+    (popolato solo per method='nli').
+    """
     from retrieve import match_with_nli, match_with_similarity, match_with_llm, extract_evidence
 
     matched = []
+    debug_data = []
+
     for claim in claims:
+        sentence_scores = []
+
         if method == "nli":
-            matches = match_with_nli(claim, passages, threshold=threshold, top_k=top_k)
+            matches, sentence_scores = match_with_nli(
+                claim, passages, threshold=threshold, top_k=top_k, return_all_scores=True
+            )
         elif method == "llm":
             matches = match_with_llm(claim, passages, threshold=threshold, top_k=top_k)
         else:
@@ -331,7 +434,9 @@ def run_retrieve(claims: list[str], passages: list[dict], method: str, threshold
 
         matches = [m for m in matches if m.get("extraction", "").strip()]
         matched.append({"claim": claim, "supporting_passages": matches})
-    return matched
+        debug_data.append({"claim": claim, "sentence_scores": sentence_scores})
+
+    return matched, debug_data
 
 
 def run_cite(response: str, matched_claims: list[dict]) -> tuple[str, list[dict]]:
@@ -740,6 +845,7 @@ if page == "🔬 Pipeline interattivo":
         if not passages:
             st.info("Nessun passage fornito — lo step retrieve verrà saltato.")
             st.session_state["matched"] = [{"claim": c, "supporting_passages": []} for c in st.session_state["claims"]]
+            st.session_state["retrieve_debug"] = []
             skip_retrieve = True
         else:
             skip_retrieve = False
@@ -748,8 +854,12 @@ if page == "🔬 Pipeline interattivo":
         if not skip_retrieve and st.button("▶ Retrieve", key="btn_retrieve"):
             with st.spinner("Matching claims → passages..."):
                 try:
-                    matched = run_retrieve(st.session_state["claims"], passages, retrieve_method, nli_threshold, top_k)
+                    matched, debug_data = run_retrieve(
+                        st.session_state["claims"], passages, retrieve_method, nli_threshold, top_k
+                    )
                     st.session_state["matched"] = matched
+                    st.session_state["retrieve_debug"] = debug_data
+                    st.session_state["retrieve_method_used"] = retrieve_method
                 except Exception as e:
                     st.error(f"Errore: {e}")
 
@@ -776,6 +886,16 @@ if page == "🔬 Pipeline interattivo":
                             st.caption(p.get("text", "")[:300] + "...")
                     else:
                         st.caption("Nessun passage di supporto trovato.")
+
+            # ── DEBUG NLI scores ──────────────────────────────────────────
+            if (
+                st.session_state.get("retrieve_method_used") == "nli"
+                and "retrieve_debug" in st.session_state
+                and any(d.get("sentence_scores") for d in st.session_state["retrieve_debug"])
+            ):
+                st.divider()
+                render_nli_debug(st.session_state["retrieve_debug"])
+            # ── fine DEBUG ────────────────────────────────────────────────
 
             st.divider()
             step_header(4, "Cite")
@@ -807,41 +927,108 @@ if page == "🔬 Pipeline interattivo":
                 step_header(5, "Evaluate")
 
                 if st.button("▶ Evaluate Citations", key="btn_evaluate"):
-                    with st.spinner("Calcolo metriche NLI..."):
+                    with st.spinner("Calcolo metriche..."):
                         try:
-                            from evaluate import citation_precision_nli, citation_recall_nli
+                            from evaluate import (
+                                citation_precision_nli, citation_recall_nli,
+                                factual_precision, factual_precision_nli,
+                                unsupported_claim_ratio, average_entailment_score
+                            )
                             matched = st.session_state["matched"]
-                            precision = citation_precision_nli(matched)
-                            recall = citation_recall_nli(matched)
+
                             st.session_state["eval_metrics"] = {
-                                "citation_precision": precision,
-                                "citation_recall": recall,
+                                "citation_precision": citation_precision_nli(matched),
+                                "citation_recall": citation_recall_nli(matched),
+                                "factual_precision": factual_precision(matched),
+                                "factual_precision_nli": factual_precision_nli(matched),
+                                "unsupported_ratio": unsupported_claim_ratio(matched),
+                                "avg_entailment_score": average_entailment_score(matched),
                             }
                         except Exception as e:
                             st.error(f"Errore nella valutazione: {e}")
 
                 if "eval_metrics" in st.session_state:
                     metrics = st.session_state["eval_metrics"]
-                    prec = metrics["citation_precision"]
-                    rec = metrics["citation_recall"]
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        color_p = "#10B981" if prec >= 0.7 else "#F59E0B" if prec >= 0.4 else "#EF4444"
-                        render_metric_card("Citation Precision", prec, color_p)
-                    with col2:
-                        color_r = "#10B981" if rec >= 0.7 else "#F59E0B" if rec >= 0.4 else "#EF4444"
-                        render_metric_card("Citation Recall", rec, color_r)
+                    METRIC_INFO = {
+                        "citation_precision": (
+                            "Citation Precision",
+                            "Percentuale di coppie (claim, passaggio citato) in cui il passaggio "
+                            "supporta effettivamente il claim, verificato tramite NLI. "
+                            "Valori alti = le citazioni puntano ai passaggi giusti."
+                        ),
+                        "citation_recall": (
+                            "Citation Recall",
+                            "Percentuale di claims per cui almeno un passaggio citato "
+                            "fornisce supporto verificato tramite NLI. "
+                            "Valori alti = tutti i claims sono coperti da citazioni valide."
+                        ),
+                        "factual_precision": (
+                            "Factual Precision",
+                            "Percentuale di claims che hanno almeno un passaggio di supporto. "
+                            "Misura se la risposta dice cose verificabili nelle fonti. "
+                            "Valori bassi = la risposta contiene informazioni non presenti nei passaggi."
+                        ),
+                        "factual_precision_nli": (
+                            "Factual Precision (NLI)",
+                            "Come Factual Precision, ma il supporto è verificato con NLI "
+                            "invece che per semplice presenza di match. Più rigorosa."
+                        ),
+                        "unsupported_ratio": (
+                            "Unsupported Ratio",
+                            "Percentuale di claims senza alcun passaggio di supporto. "
+                            "Valori alti indicano possibili allucinazioni o informazioni "
+                            "non grounded nei passaggi forniti."
+                        ),
+                        "avg_entailment_score": (
+                            "Avg Entailment Score",
+                            "Score medio di entailment tra claims e passaggi di supporto. "
+                            "Misura continua della qualità del matching. "
+                            "Valori vicini a 1.0 = supporto forte."
+                        ),
+                    }
+
+                    metric_keys = ["citation_precision", "citation_recall", "factual_precision",
+                                   "factual_precision_nli", "unsupported_ratio", "avg_entailment_score"]
+
+                    for row_start in range(0, len(metric_keys), 3):
+                        cols = st.columns(3)
+                        for col, key in zip(cols, metric_keys[row_start:row_start+3]):
+                            with col:
+                                v = metrics[key]
+                                if key == "unsupported_ratio":
+                                    color = "#10B981" if v <= 0.2 else "#F59E0B" if v <= 0.5 else "#EF4444"
+                                else:
+                                    color = "#10B981" if v >= 0.7 else "#F59E0B" if v >= 0.4 else "#EF4444"
+
+                                label, description = METRIC_INFO[key]
+                                pct = int(v * 100) if key != "unsupported_ratio" else int((1 - v) * 100)
+                                st.markdown(
+                                    f'<div class="metric-card">'
+                                    f'<div class="metric-value">{v:.3f}</div>'
+                                    f'<div class="metric-label">{label}</div>'
+                                    f'<div class="metric-bar"><div class="metric-bar-fill" style="width:{pct}%;background:{color};"></div></div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                                with st.popover("ℹ️"):
+                                    st.markdown(f"**{label}**")
+                                    st.write(description)
 
                     st.markdown("")
-                    if prec >= 0.8 and rec >= 0.8:
-                        st.success("Ottimo: citazioni precise e con buona copertura.")
-                    elif prec >= 0.8:
-                        st.warning("Citazioni precise, ma alcune frasi non sono supportate.")
-                    elif rec >= 0.8:
-                        st.warning("Buona copertura, ma alcune citazioni non supportano la frase.")
+                    fp = metrics["factual_precision"]
+                    cp = metrics["citation_precision"]
+                    cr = metrics["citation_recall"]
+                    if fp >= 0.8 and cp >= 0.8 and cr >= 0.8:
+                        st.success("Ottimo: risposta fattuale con citazioni precise e buona copertura.")
+                    elif fp >= 0.8 and cp >= 0.8:
+                        st.warning("Risposta fattuale e citazioni precise, ma copertura incompleta.")
+                    elif fp >= 0.8:
+                        st.warning("Risposta fattuale, ma le citazioni vanno migliorate.")
+                    elif fp < 0.5:
+                        st.error("Molti claims non sono supportati dai passaggi — la risposta potrebbe contenere allucinazioni.")
                     else:
-                        st.error("Sia precisione che recall sono basse — le citazioni vanno migliorate.")
+                        st.warning("Risultati misti — controlla le metriche individuali.")
 
                     result_with_eval = {
                         "query": st.session_state["query"],
@@ -853,7 +1040,6 @@ if page == "🔬 Pipeline interattivo":
                         "evaluation": metrics,
                     }
                     st.download_button("⬇ Scarica risultato con metriche", data=json.dumps(result_with_eval, indent=2, ensure_ascii=False), file_name="result_evaluated.json", mime="application/json", key="download_eval")
-
 
 # ──────────────────────────────────────────────
 # PAGE 2 — Esplora risultati

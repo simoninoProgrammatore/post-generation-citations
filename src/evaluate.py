@@ -1,12 +1,13 @@
 """
-Step 5: Evaluate cited responses using ALCE metrics.
+Step 5: Evaluate cited responses.
 
-Implements the evaluation dimensions from the ALCE framework
-(Gao et al., 2023):
+Implements evaluation along multiple dimensions:
   - Citation Precision (NLI): Are cited passages supporting the claims?
   - Citation Recall (NLI): Are all claims properly cited?
-  - Correctness: Is the answer factually correct?
-  - Fluency: Is the text natural and coherent?
+  - Factual Precision: What fraction of claims are supported by passages?
+  - Correctness Exact Match: Does the response contain gold answers?
+  - Correctness Claim Recall: Are gold claims entailed by the response?
+  - Fluency (MAUVE): Is the text natural and coherent?
 """
 
 import re
@@ -29,9 +30,7 @@ def _load_nli_model(model_name: str = "cross-encoder/nli-deberta-v3-large"):
 
 
 def _nli_entailment_score(premise: str, hypothesis: str, model_name: str) -> float:
-    """
-    Compute the entailment probability P(premise ⊨ hypothesis).
-    """
+    """Compute the entailment probability P(premise ⊨ hypothesis)."""
     model = _load_nli_model(model_name)
     scores = model.predict([(premise, hypothesis)])
     logits = np.array(scores)
@@ -60,22 +59,10 @@ def citation_precision_nli(
     threshold: float = 0.5,
 ) -> float:
     """
-    Compute citation precision at claim level using NLI.
-
     For each (claim, cited passage) pair, check if the passage
     actually entails the claim.
-
     Precision = supported pairs / total pairs
-
-    Args:
-        matched_claims: List of claims with their supporting passages.
-        nli_model_name: NLI model to use.
-        threshold:      Entailment score threshold.
-
-    Returns:
-        Precision score in [0, 1].
     """
-    # Build all (passage_text, claim) pairs for batch predict
     pairs = []
     for mc in matched_claims:
         claim = mc["claim"]
@@ -109,25 +96,13 @@ def citation_recall_nli(
     threshold: float = 0.5,
 ) -> float:
     """
-    Compute citation recall at claim level using NLI.
-
     For each claim, check if at least one of its cited passages
     entails the claim.
-
     Recall = claims with at least one valid citation / total claims
-
-    Args:
-        matched_claims: List of claims with their supporting passages.
-        nli_model_name: NLI model to use.
-        threshold:      Entailment score threshold.
-
-    Returns:
-        Recall score in [0, 1].
     """
     if not matched_claims:
         return 0.0
 
-    # Build all pairs, tracking which claim they belong to
     pairs = []
     claim_indices = []
 
@@ -150,7 +125,74 @@ def citation_recall_nli(
     probs = exp / exp.sum(axis=1, keepdims=True)
     entailment_probs = probs[:, 1]
 
-    # For each claim, check if at least one passage entails it
+    supported_claims = set()
+    for i, score in enumerate(entailment_probs):
+        if score >= threshold:
+            supported_claims.add(claim_indices[i])
+
+    return len(supported_claims) / len(matched_claims)
+
+
+# ──────────────────────────────────────────────
+# Factual Precision — claim-level
+# ──────────────────────────────────────────────
+
+def factual_precision(matched_claims: list[dict]) -> float:
+    """
+    What fraction of atomic claims are supported by at least one passage?
+    This measures whether the response says things that can be verified
+    in the source passages.
+
+    Factual Precision = claims with supporting passages / total claims
+    """
+    if not matched_claims:
+        return 0.0
+
+    supported = sum(
+        1 for mc in matched_claims
+        if mc.get("supporting_passages")
+    )
+    return supported / len(matched_claims)
+
+
+# ──────────────────────────────────────────────
+# Factual Precision (strict, NLI-verified)
+# ──────────────────────────────────────────────
+
+def factual_precision_nli(
+    matched_claims: list[dict],
+    nli_model_name: str = "cross-encoder/nli-deberta-v3-large",
+    threshold: float = 0.5,
+) -> float:
+    """
+    Stricter version: a claim is considered factually supported only if
+    at least one passage actually entails it (verified by NLI).
+    """
+    if not matched_claims:
+        return 0.0
+
+    pairs = []
+    claim_indices = []
+
+    for claim_idx, mc in enumerate(matched_claims):
+        claim = mc["claim"]
+        for passage in mc["supporting_passages"]:
+            pairs.append((passage.get("text", ""), claim))
+            claim_indices.append(claim_idx)
+
+    if not pairs:
+        return 0.0
+
+    model = _load_nli_model(nli_model_name)
+    all_scores = model.predict(pairs)
+    all_scores = np.array(all_scores)
+    if all_scores.ndim == 1:
+        all_scores = all_scores.reshape(1, -1)
+
+    exp = np.exp(all_scores - np.max(all_scores, axis=1, keepdims=True))
+    probs = exp / exp.sum(axis=1, keepdims=True)
+    entailment_probs = probs[:, 1]
+
     supported_claims = set()
     for i, score in enumerate(entailment_probs):
         if score >= threshold:
@@ -186,7 +228,8 @@ def correctness_claim_recall(
     threshold: float = 0.5,
 ) -> float:
     """
-    Compute claim recall: fraction of gold claims entailed by the response.
+    Fraction of gold claims entailed by the response.
+    Uses the full response as premise and each gold claim as hypothesis.
     """
     if not gold_claims:
         return 0.0
@@ -202,6 +245,48 @@ def correctness_claim_recall(
             entailed += 1
 
     return entailed / len(gold_claims)
+
+
+# ──────────────────────────────────────────────
+# Unsupported Claim Ratio
+# ──────────────────────────────────────────────
+
+def unsupported_claim_ratio(matched_claims: list[dict]) -> float:
+    """
+    What fraction of claims have NO supporting passage?
+    High values indicate the response contains information
+    not grounded in the provided passages.
+
+    Unsupported ratio = claims without support / total claims
+    """
+    if not matched_claims:
+        return 0.0
+
+    unsupported = sum(
+        1 for mc in matched_claims
+        if not mc.get("supporting_passages")
+    )
+    return unsupported / len(matched_claims)
+
+
+# ──────────────────────────────────────────────
+# Average Entailment Score
+# ──────────────────────────────────────────────
+
+def average_entailment_score(matched_claims: list[dict]) -> float:
+    """
+    Average entailment score across all (claim, best passage) pairs.
+    Gives a continuous measure of how well passages support claims.
+    """
+    scores = []
+    for mc in matched_claims:
+        for passage in mc["supporting_passages"]:
+            score = passage.get("entailment_score", passage.get("similarity_score", 0))
+            scores.append(score)
+
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
 
 
 # ──────────────────────────────────────────────
@@ -257,11 +342,23 @@ def evaluate_all(
         matched_claims = example.get("matched_claims", [])
         ex_metrics = {}
 
-        # Citation Precision — claim level
+        # Citation Precision
         ex_metrics["citation_precision"] = citation_precision_nli(matched_claims)
 
-        # Citation Recall — claim level
+        # Citation Recall
         ex_metrics["citation_recall"] = citation_recall_nli(matched_claims)
+
+        # Factual Precision (simple)
+        ex_metrics["factual_precision"] = factual_precision(matched_claims)
+
+        # Factual Precision (NLI-verified)
+        ex_metrics["factual_precision_nli"] = factual_precision_nli(matched_claims)
+
+        # Unsupported Claim Ratio
+        ex_metrics["unsupported_ratio"] = unsupported_claim_ratio(matched_claims)
+
+        # Average Entailment Score
+        ex_metrics["avg_entailment_score"] = average_entailment_score(matched_claims)
 
         # Correctness — Exact Match (if gold answers available)
         gold_answers = example.get("gold_answers", [])
@@ -279,6 +376,8 @@ def evaluate_all(
 
         per_example.append({
             "question": example.get("question", ""),
+            "num_claims": len(matched_claims),
+            "num_supported": sum(1 for mc in matched_claims if mc.get("supporting_passages")),
             "metrics": ex_metrics,
         })
 
