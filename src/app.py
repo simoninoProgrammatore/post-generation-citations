@@ -7,6 +7,7 @@ import json
 import os
 import re
 import streamlit as st
+import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -197,12 +198,11 @@ st.markdown("""
 st.sidebar.markdown("### 📚 Citation Pipeline")
 page = st.sidebar.radio(
     "Sezione",
-    ["🔬 Pipeline interattivo", "📂 Esplora risultati", "📊 Metriche"],
+    ["🔬 Pipeline interattivo", "📂 Esplora risultati", "📊 Metriche", "📡 Attention Analysis", "🔬 Interpretability"],
     label_visibility="collapsed",
 )
 st.sidebar.divider()
 st.sidebar.caption("Post-Generation Citation System — Tesi triennale")
-
 
 # ──────────────────────────────────────────────
 # Helpers (UI)
@@ -753,7 +753,211 @@ def build_cited_html(cited: str, matched: list[dict], refs: list[dict]) -> str:
     """
     return html
 
+# ──────────────────────────────────────────────
+# Attention viz helpers
+# ──────────────────────────────────────────────
 
+def _build_ranking_html(records: list[dict]) -> str:
+    """Barra orizzontale per ogni esempio, colorata per dominance."""
+    rows = sorted(records, key=lambda r: r["cross_attention"]["hyp_dominance_from_cls"], reverse=True)
+    items_html = ""
+    for r in rows:
+        dom = r["cross_attention"]["hyp_dominance_from_cls"]
+        e = r["probs"]["E"]
+        pct = int(dom * 100)
+        color = "#10B981" if dom < 0.55 else "#F59E0B" if dom < 0.70 else "#EF4444"
+        bias_label = r.get("bias_flag", "")
+        items_html += f"""
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;
+                    border-bottom:0.5px solid var(--color-border-tertiary,#e2e8f0);font-size:13px;">
+          <div style="min-width:180px;color:var(--color-text-secondary,#64748b);
+                      font-family:monospace;font-size:11px;">{r['id']}</div>
+          <div style="flex:1;background:var(--color-background-secondary,#f8fafc);
+                      border-radius:4px;height:10px;overflow:hidden;">
+            <div style="width:{pct}%;height:100%;background:{color};border-radius:4px;"></div>
+          </div>
+          <div style="min-width:36px;text-align:right;font-weight:500;color:{color};">{dom:.2f}</div>
+          <div style="min-width:40px;text-align:right;color:var(--color-text-secondary,#64748b);">E:{e:.2f}</div>
+          <div style="min-width:110px;font-size:11px;color:{color};">{bias_label}</div>
+        </div>"""
+    return f"""
+    <div style="font-family:sans-serif;padding:8px 0;">
+      <div style="display:flex;gap:10px;font-size:11px;color:#94a3b8;
+                  padding-bottom:6px;border-bottom:0.5px solid #e2e8f0;margin-bottom:4px;">
+        <div style="min-width:180px;">id</div>
+        <div style="flex:1;">hyp_dominance →</div>
+        <div style="min-width:36px;text-align:right;">dom</div>
+        <div style="min-width:40px;text-align:right;">E</div>
+        <div style="min-width:110px;">flag</div>
+      </div>
+      {items_html}
+      <div style="display:flex;gap:16px;margin-top:10px;font-size:11px;color:#94a3b8;">
+        <span>■ <span style="color:#10B981;">verde &lt;0.55 clean</span></span>
+        <span>■ <span style="color:#F59E0B;">giallo 0.55–0.70 sospetto</span></span>
+        <span>■ <span style="color:#EF4444;">rosso &gt;0.70 leakage</span></span>
+      </div>
+    </div>"""
+
+
+def _build_layer_chart_html(record: dict) -> str:
+    """Grafico layer: CLS→P, CLS→H, hyp_dominance."""
+    layers_data = record.get("layer_dominance", [])
+    cross = record.get("cross_attention", {})
+
+    # Usa i dati per-layer dalla cross_attention se disponibili, altrimenti solo dominance
+    layer_labels = json.dumps([f"L{l['layer']}" for l in layers_data])
+    dom_values   = json.dumps([l["mean_hyp_dominance"] for l in layers_data])
+
+    return f"""
+    <div style="font-family:sans-serif;">
+      <div style="display:flex;gap:16px;font-size:11px;color:#94a3b8;margin-bottom:8px;">
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;border-radius:2px;background:#D85A30;display:inline-block;"></span>
+          hyp_dominance per layer
+        </span>
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="border-top:2px dashed #BA7517;width:16px;display:inline-block;"></span>
+          soglia 0.65
+        </span>
+      </div>
+      <div style="position:relative;height:200px;">
+        <canvas id="layerDomChart" role="img"
+          aria-label="Hypothesis dominance across DeBERTa layers for {record['id']}">
+        </canvas>
+      </div>
+      <div style="margin-top:16px;display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+        <div style="text-align:center;padding:8px;background:#f8fafc;border-radius:8px;border:0.5px solid #e2e8f0;">
+          <div style="font-size:10px;color:#94a3b8;">CLS→P</div>
+          <div style="font-size:18px;font-weight:500;">{cross.get('CLS_to_P',0):.4f}</div>
+        </div>
+        <div style="text-align:center;padding:8px;background:#f8fafc;border-radius:8px;border:0.5px solid #e2e8f0;">
+          <div style="font-size:10px;color:#94a3b8;">CLS→H</div>
+          <div style="font-size:18px;font-weight:500;">{cross.get('CLS_to_H',0):.4f}</div>
+        </div>
+        <div style="text-align:center;padding:8px;background:#f8fafc;border-radius:8px;border:0.5px solid #e2e8f0;">
+          <div style="font-size:10px;color:#94a3b8;">P→H</div>
+          <div style="font-size:18px;font-weight:500;">{cross.get('P_to_H',0):.4f}</div>
+        </div>
+        <div style="text-align:center;padding:8px;background:#f8fafc;border-radius:8px;border:0.5px solid #e2e8f0;">
+          <div style="font-size:10px;color:#94a3b8;">H→P</div>
+          <div style="font-size:18px;font-weight:500;">{cross.get('H_to_P',0):.4f}</div>
+        </div>
+      </div>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+    <script>
+    new Chart(document.getElementById('layerDomChart'), {{
+      type: 'line',
+      data: {{
+        labels: {layer_labels},
+        datasets: [
+          {{
+            label: 'hyp_dominance',
+            data: {dom_values},
+            borderColor: '#D85A30',
+            backgroundColor: 'rgba(216,90,48,0.08)',
+            fill: true, tension: 0.35, pointRadius: 4,
+            pointBackgroundColor: '#D85A30'
+          }},
+          {{
+            label: 'soglia 0.65',
+            data: Array({len(layers_data)}).fill(0.65),
+            borderColor: 'rgba(186,117,23,0.6)',
+            borderDash: [5,3], pointRadius: 0, fill: false
+          }}
+        ]
+      }},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        plugins: {{ legend: {{ display: false }} }},
+        scales: {{
+          x: {{ grid: {{ display: false }}, ticks: {{ font: {{ size: 11 }}, color: '#888' }} }},
+          y: {{ min: 0.3, max: 1.0, grid: {{ color: 'rgba(128,128,128,0.1)' }},
+               ticks: {{ font: {{ size: 10 }}, color: '#888', callback: v => v.toFixed(2) }} }}
+        }}
+      }}
+    }});
+    </script>"""
+
+
+def _build_heatmap_html(record: dict) -> str:
+    """Heatmap della matrice di attenzione con highlight dei segmenti."""
+    matrix = record.get("attention_matrix", [])
+    tokens = record.get("tokens", [])
+    segments = record.get("segments", {})
+
+    if not matrix or not tokens:
+        return "<p style='color:#94a3b8;font-size:13px;'>Matrice non disponibile.</p>"
+
+    n = min(len(tokens), len(matrix), 48)
+    tokens_trunc = tokens[:n]
+    matrix_trunc = [row[:n] for row in matrix[:n]]
+
+    # Normalizza per il rendering
+    flat = [v for row in matrix_trunc for v in row]
+    max_val = max(flat) if flat else 1.0
+
+    def seg_color(i):
+        if i in segments.get("cls", []):        return "#E6F1FB"
+        if i in segments.get("hypothesis", []): return "#FAEEDA"
+        if i in segments.get("premise", []):    return "#EAF3DE"
+        return "#F1EFE8"
+
+    tok_labels = "".join(
+        f'<div style="width:14px;height:14px;font-size:8px;overflow:hidden;'
+        f'text-overflow:ellipsis;white-space:nowrap;text-align:center;'
+        f'background:{seg_color(i)};border-radius:2px;margin:0.5px;'
+        f'color:#334155;line-height:14px;" title="{t}">'
+        f'{t[:3]}</div>'
+        for i, t in enumerate(tokens_trunc)
+    )
+
+    cells = ""
+    for i, row in enumerate(matrix_trunc):
+        for j, val in enumerate(row):
+            intensity = val / (max_val + 1e-9)
+            alpha = round(0.05 + intensity * 0.95, 3)
+            r_col = "216,90,48" if j in segments.get("hypothesis", []) else "55,138,221"
+            cells += (
+                f'<div style="width:14px;height:14px;background:rgba({r_col},{alpha});'
+                f'border-radius:2px;margin:0.5px;" '
+                f'title="({i},{j}) = {val:.4f}"></div>'
+            )
+
+    return f"""
+    <div style="font-family:sans-serif;">
+      <div style="display:flex;gap:16px;font-size:11px;color:#94a3b8;margin-bottom:10px;flex-wrap:wrap;">
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;border-radius:2px;background:#E6F1FB;border:0.5px solid #B5D4F4;display:inline-block;"></span>CLS
+        </span>
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;border-radius:2px;background:#EAF3DE;border:0.5px solid #C0DD97;display:inline-block;"></span>Premise
+        </span>
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;border-radius:2px;background:#FAEEDA;border:0.5px solid #FAC775;display:inline-block;"></span>Hypothesis
+        </span>
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;border-radius:2px;background:rgba(216,90,48,0.7);display:inline-block;"></span>alta attenzione su H
+        </span>
+        <span style="display:flex;align-items:center;gap:4px;">
+          <span style="width:10px;height:10px;border-radius:2px;background:rgba(55,138,221,0.7);display:inline-block;"></span>alta attenzione su P
+        </span>
+      </div>
+      <div style="display:flex;gap:4px;margin-bottom:2px;padding-left:88px;">
+        <div style="display:flex;flex-wrap:nowrap;">{tok_labels}</div>
+      </div>
+      <div style="display:flex;gap:4px;align-items:flex-start;">
+        <div style="display:flex;flex-direction:column;min-width:84px;">
+          {"".join(f'<div style="height:14px;margin:0.5px;font-size:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155;line-height:14px;background:{seg_color(i)};border-radius:2px;padding:0 2px;" title="{t}">{t[:9]}</div>' for i,t in enumerate(tokens_trunc))}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat({n},14px);flex-shrink:0;">
+          {cells}
+        </div>
+      </div>
+      <p style="font-size:11px;color:#94a3b8;margin-top:10px;">
+        Hover sulle celle per vedere il valore esatto. Righe = token sorgente (da cui parte l'attenzione), colonne = token destinazione.
+      </p>
+    </div>"""
 # ──────────────────────────────────────────────
 # PAGE 1 — Pipeline interattivo
 # ──────────────────────────────────────────────
@@ -1160,3 +1364,602 @@ elif page == "📊 Metriche":
             st.info("Nessun dato per-esempio nel file.")
     else:
         st.info("Carica un file evaluation.json per visualizzare le metriche.")
+
+# ──────────────────────────────────────────────
+# PAGE 4 — Attention Analysis
+# ──────────────────────────────────────────────
+
+elif page == "📡 Attention Analysis":
+
+    
+    st.markdown(
+        '<div class="page-header">'
+        '<h1>📡 Attention Analysis</h1>'
+        '<p>Visualizza gli attention weights di DeBERTa per rilevare parametric knowledge leakage.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_attn = st.file_uploader(
+        "Carica attention_results.json (output di deberta_attention_analysis.py)",
+        type="json",
+        key="attn_upload",
+    )
+
+    if not uploaded_attn:
+        st.info("Carica un file `attention_results.json` prodotto dallo script di analisi.")
+        st.stop()
+
+    attn_data = json.load(uploaded_attn)
+    st.success(f"{len(attn_data)} esempi caricati.")
+
+    # ── Filtri ────────────────────────────────────────────────────────────────
+    categories = sorted(set(r["category"] for r in attn_data))
+    selected_cat = st.multiselect("Filtra per categoria", categories, default=categories)
+    filtered = [r for r in attn_data if r["category"] in selected_cat]
+
+    if not filtered:
+        st.warning("Nessun risultato per i filtri selezionati.")
+        st.stop()
+
+    # ── Panoramica: dominance ranking ─────────────────────────────────────────
+    st.divider()
+    step_header(1, "Panoramica dominanza H (CLS → H / CLS → P+H)")
+
+    ranking_html = _build_ranking_html(filtered)
+    st.components.v1.html(ranking_html, height=max(80 + len(filtered) * 52, 200), scrolling=False)
+
+    # ── Dettaglio per esempio ─────────────────────────────────────────────────
+    st.divider()
+    step_header(2, "Dettaglio per esempio")
+
+    example_labels = {
+        f"[{r['id']}] {r['hypothesis'][:80]}{'…' if len(r['hypothesis'])>80 else ''}": r["id"]
+        for r in filtered
+    }
+    selected_label = st.selectbox("Seleziona un esempio", list(example_labels.keys()))
+    selected_id = example_labels[selected_label]
+    record = next(r for r in filtered if r["id"] == selected_id)
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        dom = record["cross_attention"]["hyp_dominance_from_cls"]
+        color = "#10B981" if dom < 0.55 else "#F59E0B" if dom < 0.70 else "#EF4444"
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-value" style="color:{color};">{dom:.3f}</div>'
+            f'<div class="metric-label">hyp_dominance (CLS)</div>'
+            f'<div class="metric-bar"><div class="metric-bar-fill" style="width:{int(dom*100)}%;background:{color};"></div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with col_b:
+        e = record["probs"]["E"]
+        color_e = "#10B981" if e < 0.15 else "#F59E0B" if e < 0.4 else "#EF4444"
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-value" style="color:{color_e};">{e:.3f}</div>'
+            f'<div class="metric-label">entailment score</div>'
+            f'<div class="metric-bar"><div class="metric-bar-fill" style="width:{int(e*100)}%;background:{color_e};"></div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with col_c:
+        bias = record.get("bias_flag", "")
+        badge_color = {"BIAS CONFIRMED": "#EF4444", "suspicious": "#F59E0B", "clean": "#10B981"}.get(bias, "#94A3B8")
+        st.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-value" style="font-size:20px;color:{badge_color};">{bias or "N/A"}</div>'
+            f'<div class="metric-label">bias flag</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("")
+    st.markdown(f"**Premise:** {record['premise']}")
+    st.markdown(f"**Hypothesis:** {record['hypothesis']}")
+    st.markdown(f"**Expected:** `{record['expected']}` — **Predicted:** `{record['predicted']}`")
+
+    # ── Grafici layer ─────────────────────────────────────────────────────────
+    layer_chart_html = _build_layer_chart_html(record)
+    st.components.v1.html(layer_chart_html, height=420, scrolling=False)
+
+    # ── Heatmap attention matrix ──────────────────────────────────────────────
+    st.divider()
+    step_header(3, "Heatmap attention matrix (ultimi 3 layer, media heads)")
+
+    heatmap_html = _build_heatmap_html(record)
+    st.components.v1.html(heatmap_html, height=520, scrolling=True)
+
+    # ── Ablation comparison (se disponibile) ──────────────────────────────────
+    ablation_map = {r["id"]: r for r in attn_data if "ablation" in r["id"]}
+    if ablation_map:
+        st.divider()
+        step_header(4, "Ablation: premise vera vs premise vuota")
+        ablation_pairs = [
+            ("bias_zidane", "ablation_zidane_empty"),
+            ("bias_iphone", "ablation_iphone_empty"),
+        ]
+        all_ids = {r["id"]: r for r in attn_data}
+        for base_id, abl_id in ablation_pairs:
+            if base_id in all_ids and abl_id in ablation_map:
+                base = all_ids[base_id]
+                abl = ablation_map[abl_id]
+                delta = base["probs"]["E"] - abl["probs"]["E"]
+                leakage = abs(delta) < 0.05
+                with st.expander(
+                    f"{base_id} vs {abl_id} — delta E={delta:+.4f}"
+                    f"  {'⚠️ LEAKAGE FORTE' if leakage else '✓ OK'}"
+                ):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**Premise vera**")
+                        st.metric("E-score", f"{base['probs']['E']:.4f}")
+                        st.metric("hyp_dominance", f"{base['cross_attention']['hyp_dominance_from_cls']:.3f}")
+                    with c2:
+                        st.markdown("**Premise vuota/nonsense**")
+                        st.metric("E-score", f"{abl['probs']['E']:.4f}", delta=f"{delta:+.4f}")
+                        st.metric("hyp_dominance", f"{abl['cross_attention']['hyp_dominance_from_cls']:.3f}")
+                    if leakage:
+                        st.error(
+                            f"L'E-score rimane quasi invariato (delta={delta:+.4f}) "
+                            "anche sostituendo la premise con un testo irrilevante. "
+                            "Il modello sta usando la conoscenza parametrica dall'hypothesis, non la premise."
+                        )
+                    else:
+                        st.success(f"La premise influisce sulla predizione (delta={delta:+.4f}). Nessun leakage evidente.")
+
+# ──────────────────────────────────────────────
+# PAGE 5 — Interpretability (IG + Activation Patching)
+# ──────────────────────────────────────────────
+
+elif page == "🔬 Interpretability":
+    st.markdown(
+        '<div class="page-header">'
+        '<h1>🔬 Interpretability</h1>'
+        '<p>Integrated Gradients e Activation Patching per analizzare dove e come DeBERTa prende decisioni biased.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    tab_ig, tab_patch = st.tabs(["🎯 Integrated Gradients", "🔀 Activation Patching"])
+
+    # ══════════════════════════════════════════
+    # TAB 1 — Integrated Gradients
+    # ══════════════════════════════════════════
+    with tab_ig:
+        st.markdown("### Token-level attribution")
+        st.caption(
+            "Integrated Gradients misura quanto ogni token dell'input contribuisce allo score di entailment. "
+            "Token con attribuzione alta sono quelli che il modello 'usa' di più per decidere."
+        )
+
+        with st.expander("📋 Preset casi noti", expanded=False):
+            preset_case = st.selectbox(
+                "Carica un preset",
+                [
+                    "— nessun preset —",
+                    "Sean Paul (bias confermato)",
+                    "Bocelli (bias confermato)",
+                    "Pavarotti (bias confermato)",
+                    "Sean Paul clean (ablation)",
+                    "Custom",
+                ],
+                key="ig_preset",
+            )
+            PRESETS = {
+                "Sean Paul (bias confermato)": (
+                    "Jamaican rapper Sean Paul joined her as a special guest to perform their collaborative song, 'No Lie'.",
+                    "The 2018 Champions League Final was held at the NSC Olimpiyski Stadium in Kyiv, Ukraine.",
+                ),
+                "Bocelli (bias confermato)": (
+                    "Italian tenor Andrea Bocelli performed a stunning rendition of Nessun Dorma at the closing ceremony.",
+                    "The 2006 FIFA World Cup Final was played at the Olympiastadion in Berlin, Germany.",
+                ),
+                "Pavarotti (bias confermato)": (
+                    'Luciano Pavarotti performed "Nessun Dorma" via a pre-recorded video, as it was his last major public appearance before his death.',
+                    "The 2006 Winter Olympics opening ceremony was held at the Stadio Olimpico in Turin, Italy.",
+                ),
+                "Sean Paul clean (ablation)": (
+                    "Jamaican rapper Sean Paul performed a song.",
+                    "The 2018 Champions League Final was held at the NSC Olimpiyski Stadium in Kyiv, Ukraine.",
+                ),
+            }
+
+        if preset_case in PRESETS:
+            default_p, default_h = PRESETS[preset_case]
+        else:
+            default_p, default_h = "", ""
+
+        ig_premise = st.text_area("Premise", value=default_p, height=80, key="ig_premise")
+        ig_hypothesis = st.text_area("Hypothesis", value=default_h, height=80, key="ig_hypothesis")
+
+        col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+        with col_cfg1:
+            target_label = st.selectbox("Target class", ["entailment", "contradiction", "neutral"], key="ig_target")
+        with col_cfg2:
+            n_steps = st.slider("IG steps", 20, 100, 50, 10, key="ig_steps")
+        with col_cfg3:
+            do_layerwise = st.checkbox("Calcola layer-wise", value=True, key="ig_layerwise")
+
+        if st.button("▶ Run Integrated Gradients", type="primary", key="btn_ig"):
+            if not ig_premise.strip() or not ig_hypothesis.strip():
+                st.warning("Inserisci premise e hypothesis.")
+            else:
+                with st.spinner("Calcolo attribution (può richiedere 30-60 secondi)..."):
+                    try:
+                        from interpretability import integrated_gradients_analysis
+                        result = integrated_gradients_analysis(
+                            premise=ig_premise,
+                            hypothesis=ig_hypothesis,
+                            target_label=target_label,
+                            n_steps=n_steps,
+                            layerwise=do_layerwise,
+                        )
+                        st.session_state["ig_result"] = result
+                    except Exception as e:
+                        st.error(f"Errore: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+        if "ig_result" in st.session_state:
+            result = st.session_state["ig_result"]
+
+            st.divider()
+
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                st.metric("Entailment", f"{result['probs']['entailment']:.4f}")
+            with col_m2:
+                st.metric("Contradiction", f"{result['probs']['contradiction']:.4f}")
+            with col_m3:
+                st.metric("Neutral", f"{result['probs']['neutral']:.4f}")
+
+            st.caption(f"Predicted class: **{result['predicted']}** · convergence delta: `{result['convergence_delta']:.4f}`")
+
+            # ── Token attribution visualization ──────────────────
+            st.markdown("#### Token-level attribution")
+            st.caption("Verde = contributo positivo verso la classe target, rosso = contributo negativo.")
+
+            tokens = result["tokens"]
+            attributions = result["token_attributions_normalized"]
+
+            def _attr_color(val: float) -> str:
+                """Maps attribution value in [-1, 1] to a background color."""
+                if val > 0:
+                    alpha = min(abs(val), 1.0)
+                    return f"rgba(16, 185, 129, {alpha:.2f})"
+                else:
+                    alpha = min(abs(val), 1.0)
+                    return f"rgba(239, 68, 68, {alpha:.2f})"
+
+            tokens_html = ""
+            for tok, attr in zip(tokens, attributions):
+                clean_tok = tok.replace("▁", " ").replace("Ġ", " ")
+                display_tok = clean_tok if clean_tok.strip() else tok
+                bg = _attr_color(attr)
+                tokens_html += (
+                    f'<span style="background:{bg};padding:4px 6px;margin:2px;'
+                    f'border-radius:4px;display:inline-block;font-family:monospace;'
+                    f'font-size:13px;" title="attr={attr:+.3f}">{display_tok}</span>'
+                )
+
+            st.markdown(
+                f'<div style="background:#F8FAFC;padding:20px;border-radius:12px;'
+                f'border:1px solid #E2E8F0;line-height:2.4;">{tokens_html}</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ── Top tokens ──────────────────
+            st.markdown("#### Top-10 token più influenti")
+            sorted_tokens = sorted(
+                enumerate(zip(tokens, result["token_attributions"])),
+                key=lambda x: abs(x[1][1]),
+                reverse=True,
+            )[:10]
+
+            for rank, (idx, (tok, raw_attr)) in enumerate(sorted_tokens, 1):
+                clean_tok = tok.replace("▁", " ").replace("Ġ", " ")
+                direction = "↑" if raw_attr > 0 else "↓"
+                color = "#10B981" if raw_attr > 0 else "#EF4444"
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;'
+                    f'margin:4px 0;background:#F8FAFC;border-radius:8px;border:1px solid #E2E8F0;">'
+                    f'<span style="color:#94A3B8;font-family:monospace;min-width:32px;">#{rank}</span>'
+                    f'<span style="font-family:monospace;font-weight:600;min-width:100px;">{clean_tok}</span>'
+                    f'<span style="color:{color};font-family:monospace;min-width:80px;">{direction} {raw_attr:+.4f}</span>'
+                    f'<span style="color:#94A3B8;font-size:11px;">position {idx}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # ── Layer-wise heatmap ──────────────────
+            if "layerwise_attributions" in result and result["layerwise_attributions"]:
+                st.markdown("#### Layer-wise attribution heatmap")
+                st.caption(
+                    "Righe = layer (0 = input, n = output). Colonne = token. "
+                    "Intensità = magnitudo dell'attribuzione. Mostra a che layer si forma la decisione."
+                )
+
+                layer_data = result["layerwise_attributions"]
+                valid_layers = [l for l in layer_data if "error" not in l]
+
+                if valid_layers:
+                    n_layers = len(valid_layers)
+                    n_tokens_show = min(len(tokens), 48)
+
+                    # Build heatmap HTML
+                    cell_size = 14
+                    heatmap_rows = ""
+                    for layer_info in valid_layers:
+                        attrs = layer_info["token_attributions_normalized"][:n_tokens_show]
+                        cells = ""
+                        for val in attrs:
+                            if val > 0:
+                                color = f"rgba(16, 185, 129, {min(abs(val), 1.0):.2f})"
+                            else:
+                                color = f"rgba(239, 68, 68, {min(abs(val), 1.0):.2f})"
+                            cells += (
+                                f'<div style="width:{cell_size}px;height:{cell_size}px;'
+                                f'background:{color};margin:0.5px;border-radius:2px;" '
+                                f'title="attr={val:+.3f}"></div>'
+                            )
+                        heatmap_rows += (
+                            f'<div style="display:flex;align-items:center;gap:8px;margin:1px 0;">'
+                            f'<div style="min-width:40px;font-family:monospace;font-size:10px;color:#64748B;">'
+                            f'L{layer_info["layer"]}</div>'
+                            f'<div style="display:flex;">{cells}</div>'
+                            f'<div style="min-width:60px;font-family:monospace;font-size:10px;color:#94A3B8;">'
+                            f'{layer_info["mean_abs_attribution"]:.4f}</div>'
+                            f'</div>'
+                        )
+
+                    # Token labels
+                    tok_labels = "".join(
+                        f'<div style="width:{cell_size}px;font-size:8px;overflow:hidden;'
+                        f'text-overflow:ellipsis;white-space:nowrap;text-align:center;'
+                        f'margin:0.5px;color:#334155;" title="{t}">{t[:3].replace("▁", "")}</div>'
+                        for t in tokens[:n_tokens_show]
+                    )
+
+                    st.markdown(
+                        f'<div style="background:#F8FAFC;padding:20px;border-radius:12px;'
+                        f'border:1px solid #E2E8F0;overflow-x:auto;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">'
+                        f'<div style="min-width:40px;font-size:10px;color:#94A3B8;">layer</div>'
+                        f'<div style="display:flex;">{tok_labels}</div>'
+                        f'<div style="min-width:60px;font-size:10px;color:#94A3B8;">mean |attr|</div>'
+                        f'</div>'
+                        f'{heatmap_rows}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    # Layer importance chart
+                    st.markdown("#### Layer importance (mean absolute attribution)")
+                    import pandas as pd
+                    df_layers = pd.DataFrame([
+                        {"layer": l["layer"], "importance": l["mean_abs_attribution"]}
+                        for l in valid_layers
+                    ])
+                    st.bar_chart(df_layers.set_index("layer"))
+
+            # Download
+            import json as json_mod
+            st.download_button(
+                "⬇ Scarica risultato IG (JSON)",
+                data=json_mod.dumps(result, indent=2, ensure_ascii=False),
+                file_name="ig_result.json",
+                mime="application/json",
+                key="download_ig",
+            )
+
+    # ══════════════════════════════════════════
+    # TAB 2 — Activation Patching
+    # ══════════════════════════════════════════
+    with tab_patch:
+        st.markdown("### Activation Patching")
+        st.caption(
+            "Esegue un forward pass su due input (clean e corrupt), poi sostituisce le attivazioni "
+            "del corrupt in ogni layer/posizione dell'input clean. Se il patch trasferisce il bias, "
+            "quella posizione e quel layer sono causalmente responsabili del fenomeno."
+        )
+
+        st.markdown("#### Input CLEAN (baseline pulito)")
+        st.caption("Input che il modello gestisce correttamente (entailment basso su coppia neutral).")
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            clean_p = st.text_area(
+                "Premise (clean)",
+                value="Jamaican rapper Sean Paul performed a song.",
+                height=80,
+                key="patch_clean_p",
+            )
+        with col_c2:
+            clean_h = st.text_area(
+                "Hypothesis (clean)",
+                value="The 2018 Champions League Final was held at the NSC Olimpiyski Stadium in Kyiv, Ukraine.",
+                height=80,
+                key="patch_clean_h",
+            )
+
+        st.markdown("#### Input CORRUPT (biased)")
+        st.caption("Input che trigga il bias (entailment alto nonostante sia logicamente neutral).")
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            corrupt_p = st.text_area(
+                "Premise (corrupt)",
+                value="Jamaican rapper Sean Paul joined her as a special guest to perform their collaborative song, 'No Lie'.",
+                height=80,
+                key="patch_corrupt_p",
+            )
+        with col_r2:
+            corrupt_h = st.text_area(
+                "Hypothesis (corrupt)",
+                value="The 2018 Champions League Final was held at the NSC Olimpiyski Stadium in Kyiv, Ukraine.",
+                height=80,
+                key="patch_corrupt_h",
+            )
+
+        st.info(
+            "⚠️ Attenzione: activation patching è computazionalmente costoso. "
+            "Per DeBERTa-v3-large (24 layer) su ~40 token, il calcolo può durare 2-5 minuti."
+        )
+
+        if st.button("▶ Run Activation Patching", type="primary", key="btn_patch"):
+            if not all([clean_p.strip(), clean_h.strip(), corrupt_p.strip(), corrupt_h.strip()]):
+                st.warning("Compila tutti i campi.")
+            else:
+                # Progress UI
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
+                time_text = st.empty()
+                
+                import time
+                start_time = time.time()
+                
+                def update_progress(current, total, message):
+                    fraction = current / total if total > 0 else 0
+                    progress_bar.progress(fraction)
+                    status_text.markdown(f"**{message}**")
+                    if current > 0 and current < total:
+                        elapsed = time.time() - start_time
+                        eta = (elapsed / current) * (total - current)
+                        time_text.caption(
+                            f"⏱️ Elapsed: {elapsed:.0f}s · ETA: ~{eta:.0f}s · "
+                            f"{current}/{total} iterazioni ({fraction*100:.1f}%)"
+                        )
+
+                try:
+                    from interpretability import activation_patching_analysis
+                    result = activation_patching_analysis(
+                        clean_premise=clean_p,
+                        clean_hypothesis=clean_h,
+                        corrupt_premise=corrupt_p,
+                        corrupt_hypothesis=corrupt_h,
+                        progress_callback=update_progress,
+                    )
+                    st.session_state["patch_result"] = result
+                    
+                    # Clear progress UI
+                    progress_bar.empty()
+                    status_text.empty()
+                    time_text.empty()
+                    
+                    total_time = time.time() - start_time
+                    st.success(f"✅ Completato in {total_time:.1f} secondi")
+                    
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.empty()
+                    time_text.empty()
+                    st.error(f"Errore: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        if "patch_result" in st.session_state:
+            result = st.session_state["patch_result"]
+
+            st.divider()
+            col_p1, col_p2, col_p3 = st.columns(3)
+            with col_p1:
+                st.metric("E (clean)", f"{result['clean_entailment']:.4f}")
+            with col_p2:
+                st.metric("E (corrupt)", f"{result['corrupt_entailment']:.4f}")
+            with col_p3:
+                delta = result['corrupt_entailment'] - result['clean_entailment']
+                st.metric("Gap", f"{delta:+.4f}")
+
+            st.caption(
+                "Heatmap: ogni cella (layer, position) mostra quanto il patching dell'attivazione "
+                "**corrupt** in quella posizione del **clean** trasferisce il comportamento biased. "
+                "1.0 = trasferimento completo del bias, 0.0 = nessun effetto."
+            )
+
+            # ── Patching heatmap ──────────────────
+            effect = np.array(result["patching_effect"])
+            tokens = result["clean_tokens"]
+            n_layers, seq_len = effect.shape
+            n_show = min(seq_len, 48)
+
+            max_abs = max(float(np.abs(effect).max()), 1e-9)
+
+            cell_size = 14
+            heatmap_rows = ""
+            for layer_idx in range(n_layers):
+                cells = ""
+                for pos in range(n_show):
+                    val = effect[layer_idx, pos]
+                    # Normalized intensity
+                    intensity = min(abs(val) / max_abs, 1.0)
+                    if val > 0:
+                        color = f"rgba(239, 68, 68, {intensity:.2f})"  # red = transfers bias
+                    else:
+                        color = f"rgba(59, 130, 246, {intensity:.2f})"  # blue = reverses bias
+                    cells += (
+                        f'<div style="width:{cell_size}px;height:{cell_size}px;'
+                        f'background:{color};margin:0.5px;border-radius:2px;" '
+                        f'title="L{layer_idx} pos{pos} ({tokens[pos] if pos<len(tokens) else "?"}): {val:+.3f}"></div>'
+                    )
+                heatmap_rows += (
+                    f'<div style="display:flex;align-items:center;gap:6px;margin:1px 0;">'
+                    f'<div style="min-width:40px;font-family:monospace;font-size:10px;color:#64748B;">L{layer_idx}</div>'
+                    f'<div style="display:flex;">{cells}</div>'
+                    f'</div>'
+                )
+
+            tok_labels = "".join(
+                f'<div style="width:{cell_size}px;font-size:8px;overflow:hidden;'
+                f'text-overflow:ellipsis;white-space:nowrap;text-align:center;'
+                f'margin:0.5px;color:#334155;" title="{t}">{t[:3].replace("▁", "")}</div>'
+                for t in tokens[:n_show]
+            )
+
+            st.markdown(
+                f'<div style="background:#F8FAFC;padding:20px;border-radius:12px;'
+                f'border:1px solid #E2E8F0;overflow-x:auto;">'
+                f'<div style="display:flex;gap:16px;font-size:11px;color:#94A3B8;margin-bottom:8px;">'
+                f'<span>■ <span style="color:#EF4444;">rosso = patching trasferisce il bias</span></span>'
+                f'<span>■ <span style="color:#3B82F6;">blu = patching riduce l\'effetto</span></span>'
+                f'</div>'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
+                f'<div style="min-width:40px;font-size:10px;color:#94A3B8;">layer</div>'
+                f'<div style="display:flex;">{tok_labels}</div>'
+                f'</div>'
+                f'{heatmap_rows}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ── Top cells ──────────────────
+            st.markdown("#### Top-10 celle con effetto maggiore")
+            flat_effects = [
+                (l, p, float(effect[l, p]), tokens[p] if p < len(tokens) else "?")
+                for l in range(n_layers)
+                for p in range(min(seq_len, len(tokens)))
+            ]
+            flat_effects.sort(key=lambda x: abs(x[2]), reverse=True)
+
+            for rank, (layer, pos, val, tok) in enumerate(flat_effects[:10], 1):
+                clean_tok = tok.replace("▁", " ").replace("Ġ", " ")
+                color = "#EF4444" if val > 0 else "#3B82F6"
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:12px;padding:6px 12px;'
+                    f'margin:4px 0;background:#F8FAFC;border-radius:8px;border:1px solid #E2E8F0;">'
+                    f'<span style="color:#94A3B8;font-family:monospace;min-width:32px;">#{rank}</span>'
+                    f'<span style="font-family:monospace;min-width:60px;">L{layer}</span>'
+                    f'<span style="font-family:monospace;min-width:50px;color:#64748B;">pos {pos}</span>'
+                    f'<span style="font-family:monospace;font-weight:600;min-width:100px;">{clean_tok}</span>'
+                    f'<span style="color:{color};font-family:monospace;">{val:+.4f}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            import json as json_mod
+            st.download_button(
+                "⬇ Scarica risultato patching (JSON)",
+                data=json_mod.dumps(result, indent=2, ensure_ascii=False),
+                file_name="patching_result.json",
+                mime="application/json",
+                key="download_patch",
+            )                        
